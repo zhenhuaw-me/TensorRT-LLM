@@ -437,6 +437,7 @@ class KVCacheManager(BaseResourceManager):
                                  mapping: Mapping,
                                  dtype: DataType,
                                  kv_factor: int = 2):
+
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)

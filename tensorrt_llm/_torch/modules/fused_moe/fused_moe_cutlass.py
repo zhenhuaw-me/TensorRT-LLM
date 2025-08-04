@@ -32,7 +32,7 @@ class CutlassFusedMoE(MoE):
         Quant:
             fp8 block scales (SM90 Hopper only):
                 FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
-            p8 qdq, nvfp4:
+            fp8 qdq, nvfp4:
                 FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
 
     FusedMoE module:
@@ -57,6 +57,9 @@ class CutlassFusedMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
+        # max_num_tokens
+        # moe_max_num_tokens
+        # alloc workspace here
 
         super().__init__(
             routing_method=routing_method,

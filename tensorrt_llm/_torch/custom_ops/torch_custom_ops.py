@@ -1,10 +1,13 @@
 from functools import lru_cache
 from typing import List, Optional, Tuple
+from datetime import datetime
 
 import torch
+import os
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -188,26 +191,37 @@ def fused_moe(
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
-    output = run_moe(
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc1_expert_biases,
-        fc2_expert_weights,
-        fc2_expert_biases,
-        quant_scales,
-        input_sf,
-        tp_size,
-        tp_rank,
-        ep_size,
-        ep_rank,
-        cluster_size,
-        cluster_rank,
-        enable_alltoall,
-        min_latency_mode,
-        [gemm_tactic_1, gemm_tactic_2],
-    )
+    try:
+        output = run_moe(
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+            quant_scales,
+            input_sf,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            enable_alltoall,
+            min_latency_mode,
+            [gemm_tactic_1, gemm_tactic_2],
+        )
+    except Exception as e:
+        logger.error(f"Error running Moe: {e}")
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            fname = f"mem_snapshot_rank{tp_rank}_{timestamp}.pickle"
+            logger.info(f"[torch.cuda.memory] dump memory snapshot to {fname}...")
+            torch.cuda.memory._dump_snapshot(fname)
+        except Exception as e2:
+            logger.error(f"Error dumping memory snapshot: {e2}")
+        raise e
 
     return output if min_latency_mode else [output]
 

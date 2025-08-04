@@ -213,6 +213,12 @@ class PyExecutor:
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
 
+        if os.environ.get("TLLM_RECORD_MEMORY_HISTORY", "0") == "1":
+            try:
+                logger.info("[torch.cuda.memory][PyExecutor::__init__] start to watch memory usage...")
+                torch.cuda.memory._record_memory_history()
+            except Exception as e:
+                logger.error(f"Error recording memory history: {e}")
         self.is_shutdown = False
 
         # request fetcher initialization
