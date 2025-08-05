@@ -345,7 +345,7 @@ def create_py_executor(
     estimating_kv_cache = False
     kv_cache_creator = None
     if model_engine.model.model_config.is_generation:
-        #NOTE: non-generation models do not have kv cache
+        # NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(executor_config=executor_config,
                                           model_engine=model_engine,
                                           draft_model_engine=draft_model_engine,

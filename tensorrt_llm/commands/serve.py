@@ -141,6 +141,14 @@ def launch_server(host: str,
 
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
+        if os.environ.get("TLLM_RECORD_MEMORY_HISTORY", "0") == "1":
+            try:
+                logger.info(
+                    "[torch.cuda.memory][launch_server] start to watch memory usage..."
+                )
+                torch.cuda.memory._record_memory_history()
+            except Exception as e:
+                logger.error(f"Error recording memory history: {e}")
     else:
         llm = LLM(**llm_args)
 

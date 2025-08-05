@@ -308,8 +308,8 @@ public:
         std::vector<int64_t> output_shape = {num_rows, hidden_size};
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
-        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode);
+        WorkspaceMemMgr wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -327,9 +327,9 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config,
+            enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+            stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
@@ -341,9 +341,8 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config, false,
+            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
         return output;
@@ -439,8 +438,8 @@ public:
         min_latency_params.experts_to_token_score = static_cast<float*>(experts_to_token_score.data_ptr());
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
-        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode);
+        WorkspaceMemMgr wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
 
@@ -457,9 +456,9 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config,
+            enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+            stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
@@ -471,9 +470,8 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config, false,
+            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
@@ -561,10 +559,42 @@ public:
     }
 
 private:
-    struct WorkspaceInfo
+    // Use a RAII workspace memory manager to avoid torch memory fragmentation.
+    class WorkspaceMemMgr
     {
-        torch::Tensor workspace{};
-        void* src_to_dest_map{};
+    public:
+        WorkspaceMemMgr(cudaStream_t stream, size_t moe_workspace_size, size_t src_to_dest_map_size)
+            : mStream(stream)
+        {
+            // allocate the 2 memory blocks in one cudaMallocAsync call.
+            TLLM_CUDA_CHECK(::cudaMallocAsync(&mWorkspacePtr, moe_workspace_size + src_to_dest_map_size, mStream));
+            mSrcToDestMapPtr = reinterpret_cast<int*>(mWorkspacePtr + moe_workspace_size);
+        }
+
+        char* getWorkspacePtr() const
+        {
+            return mWorkspacePtr;
+        }
+
+        int* getSrcToDestMapPtr() const
+        {
+            return mSrcToDestMapPtr;
+        }
+
+        ~WorkspaceMemMgr()
+        {
+            if (mWorkspacePtr != nullptr)
+            {
+                TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeAsync(mWorkspacePtr, mStream));
+                mWorkspacePtr = nullptr;
+                mSrcToDestMapPtr = nullptr;
+            }
+        }
+
+    private:
+        cudaStream_t mStream;
+        char* mWorkspacePtr{nullptr};
+        int* mSrcToDestMapPtr{nullptr};
     };
 
     std::mutex mMutex;
@@ -622,26 +652,17 @@ private:
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
-    WorkspaceInfo getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
+    WorkspaceMemMgr getWorkspaceMemMgr(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int num_experts, int experts_per_token, ActivationType activation_type,
-        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode)
+        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode, cudaStream_t stream)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4A8GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
-
-        std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
-
-        size_t total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
-
-        WorkspaceInfo info{};
-        info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
-            torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
-        info.src_to_dest_map
-            = common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace.data_ptr()), moe_workspace_size);
-
-        return info;
+        std::cout << "[getWorkspaceInfo|" << this << "] moe_workspace_size: " << moe_workspace_size
+                  << ", src_to_dest_map_size: " << src_to_dest_map_size << std::endl;
+        return {stream, moe_workspace_size, src_to_dest_map_size};
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
