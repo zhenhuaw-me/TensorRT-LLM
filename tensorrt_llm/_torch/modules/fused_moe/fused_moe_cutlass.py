@@ -2,7 +2,6 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm.logger import logger
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
@@ -280,8 +279,6 @@ class CutlassFusedMoE(MoE):
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
                 x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
-        logger.info(
-            f"[forward_chunk|{hex(id(self))} torch.ops.trtllm.fused_moe] ")
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,

@@ -308,7 +308,7 @@ public:
         std::vector<int64_t> output_shape = {num_rows, hidden_size};
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
-        WorkspaceMemMgr wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
+        WorkspaceMemMgr* wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
@@ -327,7 +327,7 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config,
+            wksp_mem->getWorkspacePtr(), output.data_ptr(), wksp_mem->getSrcToDestMapPtr(), parallelism_config,
             enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
             stream);
 #else
@@ -341,7 +341,7 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config, false,
+            wksp_mem->getWorkspacePtr(), output.data_ptr(), wksp_mem->getSrcToDestMapPtr(), parallelism_config, false,
             lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
@@ -438,7 +438,7 @@ public:
         min_latency_params.experts_to_token_score = static_cast<float*>(experts_to_token_score.data_ptr());
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
-        WorkspaceMemMgr wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
+        WorkspaceMemMgr* wksp_mem = getWorkspaceMemMgr(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
@@ -456,7 +456,7 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config,
+            wksp_mem->getWorkspacePtr(), output.data_ptr(), wksp_mem->getSrcToDestMapPtr(), parallelism_config,
             enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
             stream);
 #else
@@ -470,7 +470,7 @@ public:
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            wksp_mem.getWorkspacePtr(), output.data_ptr(), wksp_mem.getSrcToDestMapPtr(), parallelism_config, false,
+            wksp_mem->getWorkspacePtr(), output.data_ptr(), wksp_mem->getSrcToDestMapPtr(), parallelism_config, false,
             lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
@@ -563,12 +563,44 @@ private:
     class WorkspaceMemMgr
     {
     public:
-        WorkspaceMemMgr(cudaStream_t stream, size_t moe_workspace_size, size_t src_to_dest_map_size)
-            : mStream(stream)
+        WorkspaceMemMgr() {}
+
+        void alloc(cudaStream_t stream, size_t moe_workspace_size, size_t src_to_dest_map_size)
         {
-            // allocate the 2 memory blocks in one cudaMallocAsync call.
-            TLLM_CUDA_CHECK(::cudaMallocAsync(&mWorkspacePtr, moe_workspace_size + src_to_dest_map_size, mStream));
-            mSrcToDestMapPtr = reinterpret_cast<int*>(mWorkspacePtr + moe_workspace_size);
+            if ((mWorkspacePtr != nullptr)
+                && ((moe_workspace_size + src_to_dest_map_size) > (mWorkspaceSize + mSrcToDestMapSize)))
+            {
+                free();
+            }
+
+            if (mWorkspacePtr == nullptr)
+            {
+                size_t free_mem{0};
+                size_t total_mem{0};
+                constexpr float GB = 1024.0 * 1024.0 * 1024.0;
+                cudaMemGetInfo(&free_mem, &total_mem);
+                std::cout << "[WorkspaceMemMgr::alloc] " << static_cast<float>(moe_workspace_size + src_to_dest_map_size)
+                          << "GB from: free_mem: " << static_cast<float>(free_mem) / GB << "GB, total_mem: "
+                          << static_cast<float>(total_mem) / GB << "GB" << std::endl;
+                mStream = stream;
+                TLLM_CUDA_CHECK(::cudaMallocAsync(&mWorkspacePtr, moe_workspace_size + src_to_dest_map_size, mStream));
+            }
+
+            mWorkspaceSize = moe_workspace_size;
+            mSrcToDestMapSize = src_to_dest_map_size;
+            mSrcToDestMapPtr = reinterpret_cast<int*>(mWorkspacePtr + mWorkspaceSize);
+        }
+
+        void free()
+        {
+            if (mWorkspacePtr != nullptr)
+            {
+                TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeAsync(mWorkspacePtr, mStream));
+                mWorkspacePtr = nullptr;
+                mSrcToDestMapPtr = nullptr;
+                mWorkspaceSize = 0;
+                mSrcToDestMapSize = 0;
+            }
         }
 
         char* getWorkspacePtr() const
@@ -583,16 +615,13 @@ private:
 
         ~WorkspaceMemMgr()
         {
-            if (mWorkspacePtr != nullptr)
-            {
-                TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeAsync(mWorkspacePtr, mStream));
-                mWorkspacePtr = nullptr;
-                mSrcToDestMapPtr = nullptr;
-            }
+            free();
         }
 
     private:
         cudaStream_t mStream;
+        size_t mWorkspaceSize{0};
+        size_t mSrcToDestMapSize{0};
         char* mWorkspacePtr{nullptr};
         int* mSrcToDestMapPtr{nullptr};
     };
@@ -652,7 +681,7 @@ private:
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
-    WorkspaceMemMgr getWorkspaceMemMgr(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
+    WorkspaceMemMgr* getWorkspaceMemMgr(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int num_experts, int experts_per_token, ActivationType activation_type,
         kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode, cudaStream_t stream)
     {
@@ -662,7 +691,10 @@ private:
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
         std::cout << "[getWorkspaceInfo|" << this << "] moe_workspace_size: " << moe_workspace_size
                   << ", src_to_dest_map_size: " << src_to_dest_map_size << std::endl;
-        return {stream, moe_workspace_size, src_to_dest_map_size};
+
+        static WorkspaceMemMgr wksp_mem;
+        wksp_mem.alloc(stream, moe_workspace_size, src_to_dest_map_size);
+        return &wksp_mem;
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
