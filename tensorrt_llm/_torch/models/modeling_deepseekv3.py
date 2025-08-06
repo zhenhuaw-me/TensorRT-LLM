@@ -593,6 +593,7 @@ class Deepseekv3MoE(nn.Module):
 
 
 class DeepseekV3DecoderLayer(DecoderLayer):
+    moe_mpool = None
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
@@ -687,6 +688,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
+        if not DeepseekV3DecoderLayer.moe_mpool:
+            DeepseekV3DecoderLayer.moe_mpool = torch.cuda.MemPool()
+            logger.info(f"[DeepseekV3DecoderLayer[{hex(id(self))}]::__init__] created shared MOE mpool {DeepseekV3DecoderLayer.moe_mpool.id}")
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -779,16 +783,18 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
-            return self.mlp(
-                hidden_states,
-                hidden_states_fp4,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
-                final_all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                          or self.mapping.tp_size == 1)),
-                do_finalize=do_finalize,
-            )
+            with torch.cuda.use_mem_pool(DeepseekV3DecoderLayer.moe_mpool):
+                logger.info(f"[DeepseekV3DecoderLayer{hex(id(self))}::forward_MoE::_run_MoE] running MOE with shared mpool id: {DeepseekV3DecoderLayer.moe_mpool.id}")
+                return self.mlp(
+                    hidden_states,
+                    hidden_states_fp4,
+                    all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                    all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
+                    final_all_reduce_params=AllReduceParams(
+                        enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                                or self.mapping.tp_size == 1)),
+                    do_finalize=do_finalize,
+                )
 
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
@@ -1072,6 +1078,7 @@ class DeepseekV3Model(DecoderModel):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1090,6 +1097,7 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
+        logger.info(f"[DeepseekV3Model::forward][{hex(id(self))}] running layers")
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
@@ -1122,7 +1130,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
         self.model_nextn = 0
         if model_config.spec_config is not None:
             model_nextn = model_config.spec_config.num_nextn_predict_layers
