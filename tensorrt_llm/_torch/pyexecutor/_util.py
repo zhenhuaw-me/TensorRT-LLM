@@ -100,6 +100,7 @@ class KvCacheCreator:
 
     def _cal_max_tokens(self, peak_memory, total_gpu_memory, fraction,
                         alloc_kv_tokens: int) -> int:
+        assert peak_memory < total_gpu_memory
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
         kv_size_per_token = self._get_cache_size_per_token(
@@ -234,6 +235,8 @@ class KvCacheCreator:
                     if response.has_error():
                         raise RuntimeError(response.error_msg)
 
+            logger.info(f"torch.cuda.memory_stats(): \n {torch.cuda.memory_stats()}")
+
             torch_peak_memory = torch.cuda.memory_stats(
             )["allocated_bytes.all.peak"]
 
@@ -248,8 +251,14 @@ class KvCacheCreator:
             py_executor.enable_iter_perf_stats = origin_iter_stats
             py_executor.set_gather_responses(False)
 
+        logger.info(f"torch.cuda.mem_get_info(): {end / (GB):.2f} GiB, {total_gpu_memory / (GB):.2f} GiB")
+        logger.info(f"torch_peak_memory: {torch_peak_memory / (GB):.2f} GiB")
+        logger.info(f"model_bytes: {model_bytes / (GB):.2f} GiB")
+        logger.info(f"torch_used_bytes: {torch_used_bytes / (GB):.2f} GiB")
         total_used_bytes = total_gpu_memory - end
         activation_bytes = torch_peak_memory - model_bytes
+        logger.info(f"activation_bytes: {activation_bytes / (GB):.2f} GiB")
+        logger.info(f"total_used_bytes: {total_used_bytes / (GB):.2f} GiB")
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
         peak_memory = torch_peak_memory + extra_cost
         logger.info(
