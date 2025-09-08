@@ -508,11 +508,13 @@ class Attention(nn.Module):
                                    attention_mask_data,
                                    mrope_config=mrope_config,
                                    attention_sinks=attention_sinks)
-
+        logger.debug(f"[Attention forward] layer_idx: {self.layer_idx}, o_proj")
         attn_output = self.o_proj(output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
+        logger.debug(
+            f"[Attention forward] layer_idx: {self.layer_idx}, o_proj done")
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

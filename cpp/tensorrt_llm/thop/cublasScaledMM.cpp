@@ -66,9 +66,15 @@ AlgoListType fp8_algo_list = {
     {{8, 8192, 8192}, {393, 36, 1, 0, 0, 5, 2}},
     // [-algo66 -m_tile10 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 8192, 57344}, {10, 36, 1, 0, 0, 1, 2}},
-    // Llama-3.3-70B TP4 (this is the default algo on B200. Here we aim to use the same algo on GB200.)
+    // Llama-3.3-70B 1k/8k TP4 - GatedMLP up proj
     // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga4 -m_scheduling1]
     {{8, 8192, 14336}, {393, 36, 1, 0, 1, 1, 4}},
+    // Llama-3.3-70B 1k/1k - MHA out proj
+    // [-algo66 -m_tile20 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga6 -m_scheduling1]
+    {{256, 8192, 8192}, {20, 36, 1, 0, 0, 3, 6}},
+    // Llama-3.3-70B 1k/1k - GatedMLP down proj
+    // [-algo66 -m_tile20 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga6 -m_scheduling1]
+    {{256, 28672, 8192}, {20, 36, 1, 0, 0, 3, 6}},
 };
 
 void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 7> const& attr_list)

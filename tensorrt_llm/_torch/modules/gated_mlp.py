@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
@@ -127,11 +128,20 @@ class GatedMLP(nn.Module):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
+        logger.debug(
+            f"[GatedMLP forward] layer_idx: {self.layer_idx}, gate_up_proj")
         h1 = self.gate_up_proj(x)
+        logger.debug(
+            f"[GatedMLP forward] layer_idx: {self.layer_idx}, gate_up_proj done"
+        )
         h2 = self._apply_activation(h1)
+        logger.debug(
+            f"[GatedMLP forward] layer_idx: {self.layer_idx}, down_proj")
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 layer_idx=self.layer_idx)
+        logger.debug(
+            f"[GatedMLP forward] layer_idx: {self.layer_idx}, down_proj done")
         return output
 
     def forward_lora(
