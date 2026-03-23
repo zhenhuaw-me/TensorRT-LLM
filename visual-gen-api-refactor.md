@@ -45,25 +45,25 @@ TensorRT-LLM's VisualGen API is marked `prototype`. Before graduating to `stable
 
 ### Compact Comparison
 
-| Aspect | Diffusers | SGLang Diffusion | vLLM-Omni | TRT-LLM (current) |
-|--------|-----------|------------------|-----------|-------------------|
-| **Engine init** | `Pipeline.from_pretrained(model)` | `Server(model_path=...)` | `Omni(model=...)` | `VisualGen(model_path=..., diffusion_args=...)` |
-| **Engine config** | Pipeline init kwargs | `ServerArgs` + `PipelineConfig` | `EngineArgs` | `VisualGenArgs` (Pydantic) |
-| **Request params** | Flat `__call__(**kwargs)` | `SamplingParams` dataclass (model subclasses) | `OmniDiffusionSamplingParams` (mega-dataclass) | `VisualGenParams` dataclass |
-| **Model-specific defaults** | Per-pipeline `__call__` defaults | `ClassVar` on subclasses (`_default_height`) | Pass-through (None → model decides) | Hardcoded on `VisualGenParams` |
-| **Model-specific params** | Per-pipeline kwargs | Fields on model subclass | `extra_args: dict` | Flat fields on shared dataclass |
-| **Output type** | PIL Image (default) / np / pt | File path / frames | Base64 PNG (OpenAI) | Raw `torch.Tensor` |
-| **Encoding utils** | `export_to_video()` in utils | Built into `SamplingParams` | In API server layer | `MediaStorage` in `serve/` |
-| **Input type** | `prompt: str \| list[str]` | `SamplingParams.prompt` | `list[OmniPromptType]` | `VisualGenInputs` (union type) |
-| **Prompt in params?** | Yes (kwarg to `__call__`) | Yes (field on `SamplingParams`) | Separate (`OmniDiffusionRequest.prompts`) | Separate (`inputs` arg) |
-| **Batch API** | `prompt=["a", "b"]` (list) | Per-request | `OmniDiffusionRequest.prompts` list | `VisualGenInputs` accepts `Sequence` |
+
+| Aspect                      | Diffusers                         | SGLang Diffusion                              | vLLM-Omni                                      | TRT-LLM (current)                               |
+| --------------------------- | --------------------------------- | --------------------------------------------- | ---------------------------------------------- | ----------------------------------------------- |
+| **Engine init**             | `Pipeline.from_pretrained(model)` | `Server(model_path=...)`                      | `Omni(model=...)`                              | `VisualGen(model_path=..., diffusion_args=...)` |
+| **Engine config**           | Pipeline init kwargs              | `ServerArgs` + `PipelineConfig`               | `EngineArgs`                                   | `VisualGenArgs` (Pydantic)                      |
+| **Request params**          | Flat `__call__(**kwargs)`         | `SamplingParams` dataclass (model subclasses) | `OmniDiffusionSamplingParams` (mega-dataclass) | `VisualGenParams` dataclass                     |
+| **Model-specific defaults** | Per-pipeline `__call__` defaults  | `ClassVar` on subclasses (`_default_height`)  | Pass-through (None → model decides)            | Hardcoded on `VisualGenParams`                  |
+| **Model-specific params**   | Per-pipeline kwargs               | Fields on model subclass                      | `extra_args: dict`                             | Flat fields on shared dataclass                 |
+| **Output type**             | PIL Image (default) / np / pt     | File path / frames                            | Base64 PNG (OpenAI)                            | Raw `torch.Tensor`                              |
+| **Encoding utils**          | `export_to_video()` in utils      | Built into `SamplingParams`                   | In API server layer                            | `MediaStorage` in `serve/`                      |
+| **Input type**              | `prompt: str | list[str]`         | `SamplingParams.prompt`                       | `list[OmniPromptType]`                         | `VisualGenInputs` (union type)                  |
+| **Prompt in params?**       | Yes (kwarg to `__call__`)         | Yes (field on `SamplingParams`)               | Separate (`OmniDiffusionRequest.prompts`)      | Separate (`inputs` arg)                         |
+| **Batch API**               | `prompt=["a", "b"]` (list)        | Per-request                                   | `OmniDiffusionRequest.prompts` list            | `VisualGenInputs` accepts `Sequence`            |
+
 
 ### Critical Lessons from Other Frameworks
 
 1. **SGLang's default-value bug** ([Issue #20078](https://github.com/sgl-project/sglang/issues/20078), Mar 2026): Generic defaults overrode model-specific ones, causing `guidance_scale=7.5` instead of `0.0` for distilled models. **Our current hardcoded defaults in `VisualGenParams` create the same risk.**
-
 2. **vLLM-omni's mega-dataclass anti-pattern**: [`OmniDiffusionSamplingParams`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/inputs/data.py) has ~100+ fields mixing user params with runtime state (`latents`, `timesteps`, `step_index`, `past_key_values`). Convenient internally; terrible as a public API. **We must keep request wire-types separate from user-facing params.**
-
 3. **Diffusers' prompt-in-kwargs simplicity**: Users write `pipeline(prompt="cat", height=512)`. No separate input type. The prompt IS a parameter. This is the simplest API in the ecosystem.
 
 Source code references in [Appendix](#appendix-framework-source-code-references).
@@ -82,7 +82,7 @@ visual_gen = VisualGen(
 )
 ```
 
-[Source: `VisualGen.__init__`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L474-L490)
+[Source: `VisualGen.__init_](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L474-L490)_`
 
 Internally: `VisualGen.__init__` → creates `DiffusionRemoteClient` → spawns worker processes → each worker runs `PipelineLoader.load()` → `DiffusionModelConfig.from_pretrained()` → `AutoPipeline.from_config()` → `BasePipeline.__init__` → `warmup()` → sends READY signal.
 
@@ -96,18 +96,20 @@ This is inconsistent with the LLM API pattern where [`LlmArgs`](https://github.c
 
 **What's in `config.py` today:**
 
-| Class | User-facing? | Should be public? |
-|-------|:---:|:---:|
-| `VisualGenArgs` | Yes — users instantiate it | Yes |
-| `ParallelConfig` | Yes — users tune parallelism | Yes |
-| `CompilationConfig` | Yes — users configure warmup shapes | Yes |
-| `TorchCompileConfig` | Yes — users enable/disable torch.compile | Yes |
-| `CudaGraphConfig` | Yes — users enable/disable CUDA graphs | Yes |
-| `PipelineConfig` | Yes — users configure offloading | Yes |
-| `AttentionConfig` | Yes — users select attention backend | Yes |
-| `TeaCacheConfig` | Yes — users enable/configure TeaCache | Yes |
-| `PipelineComponent` | Yes — users specify skip_components | Yes |
-| `DiffusionModelConfig` | No — created internally by `PipelineLoader` | No |
+
+| Class                  | User-facing?                                | Should be public? |
+| ---------------------- | ------------------------------------------- | ----------------- |
+| `VisualGenArgs`        | Yes — users instantiate it                  | Yes               |
+| `ParallelConfig`       | Yes — users tune parallelism                | Yes               |
+| `CompilationConfig`    | Yes — users configure warmup shapes         | Yes               |
+| `TorchCompileConfig`   | Yes — users enable/disable torch.compile    | Yes               |
+| `CudaGraphConfig`      | Yes — users enable/disable CUDA graphs      | Yes               |
+| `PipelineConfig`       | Yes — users configure offloading            | Yes               |
+| `AttentionConfig`      | Yes — users select attention backend        | Yes               |
+| `TeaCacheConfig`       | Yes — users enable/configure TeaCache       | Yes               |
+| `PipelineComponent`    | Yes — users specify skip_components         | Yes               |
+| `DiffusionModelConfig` | No — created internally by `PipelineLoader` | No                |
+
 
 **Recommendation**: Move user-facing config classes out of `_torch/` to a public module, mirroring the LLM API pattern:
 
@@ -148,11 +150,13 @@ However, `VisualGenArgs` currently defines `to_dict()` and `from_dict()` (lines 
 
 **Motivation**: The parameter name `diffusion_args` leaks the implementation detail that these are "diffusion" models, which is part of the broader "Diffusion" prefix elimination (§10.3).
 
-| Option | Constructor | Rationale |
-|--------|------------|-----------|
-| **A — `args`** | `VisualGen(model_path="...", args=VisualGenArgs(...))` | Short, matches the type name (`VisualGenArgs`). Consistent with common Python patterns. |
-| **B — `config`** | `VisualGen(model_path="...", config=VisualGenArgs(...))` | Semantic — "config" communicates engine configuration. But the type is `*Args`, not `*Config`, creating a slight mismatch. |
+
+| Option             | Constructor                                                 | Rationale                                                                                                                                |
+| ------------------ | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **A — `args`**     | `VisualGen(model_path="...", args=VisualGenArgs(...))`      | Short, matches the type name (`VisualGenArgs`). Consistent with common Python patterns.                                                  |
+| **B — `config`**   | `VisualGen(model_path="...", config=VisualGenArgs(...))`    | Semantic — "config" communicates engine configuration. But the type is `*Args`, not `*Config`, creating a slight mismatch.               |
 | **C — `**kwargs`** | `VisualGen(model_path="...", parallel=ParallelConfig(...))` | Matches `LLM(model=..., **kwargs)` where kwargs are fields of `LlmArgs`. More ergonomic but loses explicit `VisualGenArgs` construction. |
+
 
 **Recommendation**: **Option A — `args`**. It's the simplest rename and matches the type name. Option C is a larger design change that can be considered later.
 
@@ -160,10 +164,12 @@ However, `VisualGenArgs` currently defines `to_dict()` and `from_dict()` (lines 
 
 LLM uses `model=`. VisualGen uses `model_path=`. The `_path` suffix suggests only local file paths are accepted, but HuggingFace Hub IDs work too (e.g. `"Wan-AI/Wan2.1-T2V-1.3B-Diffusers"`). The name `model` is also the standard parameter in diffusers (`Pipeline.from_pretrained(model)`), SGLang (`Server(model_path=...)`), and vLLM (`Omni(model=...)`).
 
-| Option | Constructor | Matches |
-|--------|------------|---------|
-| **Keep `model_path`** | `VisualGen(model_path="Wan-AI/...")` | SGLang's `model_path` |
-| **Rename to `model`** | `VisualGen(model="Wan-AI/...")` | LLM API, diffusers, vLLM |
+
+| Option                | Constructor                          | Matches                  |
+| --------------------- | ------------------------------------ | ------------------------ |
+| **Keep `model_path`** | `VisualGen(model_path="Wan-AI/...")` | SGLang's `model_path`    |
+| **Rename to `model`** | `VisualGen(model="Wan-AI/...")`      | LLM API, diffusers, vLLM |
+
 
 **Recommendation**: Rename to `model` for consistency with `LLM(model=...)` and the broader ecosystem. If backward compatibility is needed, keep `model_path` as a deprecated alias.
 
@@ -172,6 +178,7 @@ LLM uses `model=`. VisualGen uses `model_path=`. The `_path` suffix suggests onl
 ## 4. Phase 2 — Request Construction
 
 This is the most contentious area. Three interconnected questions:
+
 1. Should prompt and params be separate arguments or a single request object?
 2. How do we handle model-specific parameters without the dataclass exploding?
 3. What should default values be?
@@ -193,21 +200,24 @@ The prompt types `VisualGenTextPrompt` and `VisualGenTokensPrompt` add `negative
 
 #### How Others Handle This
 
-| Framework | Pattern | Prompt in params? |
-|-----------|---------|-------------------|
-| **Diffusers** | `pipeline(prompt="cat", height=512, ...)` | Yes — flat kwargs |
-| **SGLang** | `SamplingParams(prompt="cat", height=480, ...)` | Yes — field on params |
-| **vLLM-omni** | `OmniDiffusionRequest(prompts=[...], sampling_params=...)` | No — separate |
-| **LLM API** | `llm.generate(inputs="text", sampling_params=SamplingParams(...))` | No — separate |
+
+| Framework     | Pattern                                                            | Prompt in params?     |
+| ------------- | ------------------------------------------------------------------ | --------------------- |
+| **Diffusers** | `pipeline(prompt="cat", height=512, ...)`                          | Yes — flat kwargs     |
+| **SGLang**    | `SamplingParams(prompt="cat", height=480, ...)`                    | Yes — field on params |
+| **vLLM-omni** | `OmniDiffusionRequest(prompts=[...], sampling_params=...)`         | No — separate         |
+| **LLM API**   | `llm.generate(inputs="text", sampling_params=SamplingParams(...))` | No — separate         |
+
 
 For **LLM**, separating prompt from params makes sense because `SamplingParams` is genuinely reusable — you often generate 100 different prompts with the same temperature/top_p. The prompt is the "input data"; params are "control knobs".
 
 For **visual generation**, the picture is different:
-- The "prompt" (text) is just one of potentially many inputs: text, negative text, reference image, mask, last frame.
+
+- The "prompt" (text) is just one of potentially many inputs: text, negative text, reference image, last frame.
 - Resolution, num_frames, and seed are often per-request (unlike LLM where temperature is shared).
 - The distinction between "input" (the creative content) and "params" (the technical config) is blurrier.
 
-#### Discussion: Two Options
+#### Discussion: Three Options
 
 > **Note on return type**: The signatures below use `VisualGenOutput`, a proposed wrapper around `MediaOutput` that adds request-level metadata. See §6.1 for the motivation, design, and naming discussion.
 
@@ -228,7 +238,6 @@ class VisualGenRequest:
     prompt: str
     negative_prompt: Optional[str] = None
     image: Optional[Union[str, List[str]]] = None
-    mask: Optional[str] = None
     height: Optional[int] = None
     width: Optional[int] = None
     num_inference_steps: Optional[int] = None
@@ -253,25 +262,62 @@ def generate(
 ) -> Union[VisualGenOutput, List[VisualGenOutput]]:
 ```
 
-Where `VisualGenParams` holds negative_prompt, image, mask along with other params. The first arg is purely the text prompt.
+Where `VisualGenParams` holds negative_prompt, image along with other params. The first arg is purely the text prompt.
 
 Pros: Simplest signature. `prompt` is always a string (or list of strings). Everything else is in params.
-Cons: Negative prompt is semantically an "input", not a "param". But diffusers treats it the same way (`pipeline(prompt=..., negative_prompt=...)`), so users expect it.
+Cons: Mixes creative intent with generation knobs — `image` (what to generate from) sits next to `seed` (how to generate). `negative_prompt` is semantically an "input" (text that gets encoded through the text encoder), not a "param". Batching with per-request images requires per-request params, which conflates "different content" with "different settings."
+
+**Option C: Separate inputs from params — `VisualGenInputs` + `VisualGenParams`**
+
+```python
+def generate(
+    self,
+    inputs: Union[str, VisualGenInputs, List[Union[str, VisualGenInputs]]],
+    params: Optional[Union[VisualGenParams, List[VisualGenParams]]] = None,
+) -> Union[VisualGenOutput, List[VisualGenOutput]]:
+```
+
+```python
+@dataclass
+class VisualGenInputs:
+    """Everything that specifies WHAT to generate."""
+    prompt: str
+    negative_prompt: Optional[str] = None
+    image: Optional[Union[str, List[str]]] = None
+    # Future: video, mask (inpainting), style_image, depth_map, audio, ...
+```
+
+`VisualGenParams` holds only generation settings — resolution, steps, guidance_scale, seed, frame_rate, `image_cond_strength`, etc.
+
+The key design principle: **if changing it changes WHAT is generated, it's an input; if it changes HOW it's generated, it's a param.**
+
+
+| Field                 | Changes what or how?                           | Where it belongs  |
+| --------------------- | ---------------------------------------------- | ----------------- |
+| `prompt`              | What → completely different output             | `VisualGenInputs` |
+| `negative_prompt`     | What → encoded by text encoder, alters content | `VisualGenInputs` |
+| `image`               | What → different reference = different output  | `VisualGenInputs` |
+| `guidance_scale`      | How → same content, different adherence        | `VisualGenParams` |
+| `seed`                | How → same content, different variation        | `VisualGenParams` |
+| `height`/`width`      | How → same content, different resolution       | `VisualGenParams` |
+| `image_cond_strength` | How → knob on conditioning strength            | `VisualGenParams` |
+
+
+Pros: Clean semantic separation — every field is in its correct place. Batching naturally supports per-request images (each `VisualGenInputs` has its own image+text). Mirrors the LLM API `generate(inputs, sampling_params)` pattern exactly. Extensible for future multimodal inputs without bloating params. Consistent with how the LLM side already treats images (via `multi_modal_data` on the prompt, not on `SamplingParams`).
+Cons: Slightly more verbose for I2V cases (must construct `VisualGenInputs`), but `Union[str, VisualGenInputs]` keeps the simple text-only case ergonomic.
 
 #### Recommendation
 
-**Option B is recommended** — keep prompt and params separate with the simplest possible signature:
+**Option C is recommended** — separate inputs from params, with `VisualGenInputs` for creative intent and `VisualGenParams` for generation settings:
 
-1. **`prompt` is always `str` (or `List[str]`)**: No separate `VisualGenPrompt` type. Text prompt is the first-class input; conditioning inputs (image, mask, negative_prompt) live on `VisualGenParams` alongside generation knobs, matching how diffusers handles them.
-
+1. **`inputs` accepts `str` or `VisualGenInputs`**: The `Union[str, VisualGenInputs, ...]` typing keeps the text-only case as simple as `generate("A cat")`. When conditioning inputs are needed (image, negative_prompt), use `VisualGenInputs`.
 2. **`params` defaults to `None`** (meaning use model defaults): This gives the ergonomic `visual_gen.generate("A cat")` one-liner.
-
-3. **Support both single and batch**: `prompt` accepts `str` or `list`, matching [`LLM.generate()`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/llm.py#L289-L306) which also accepts `Union[PromptInputs, Sequence[PromptInputs]]`.
-
+3. **Support both single and batch**: `inputs` accepts single or list, matching [`LLM.generate()`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/llm.py#L289-L306) which also accepts `Union[PromptInputs, Sequence[PromptInputs]]`.
 4. **`params` can be single or list**: Single params shared across batch, or per-request params list. Again matches [`LLM.generate()`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/llm.py#L292-L293) which accepts `Optional[Union[SamplingParams, List[SamplingParams]]]`.
+5. **`negative_prompt` on `VisualGenInputs`, not on `VisualGenParams`**: It is text that gets encoded through the text encoder — it specifies what NOT to generate, which is creative intent. Users who want a shared negative prompt across a batch can set it on each `VisualGenInputs`, or model pipelines provide sensible defaults (e.g., Wan I2V already has `WAN_DEFAULT_NEGATIVE_PROMPT` used when `negative_prompt is None`).
 
 ```python
-# Minimal
+# Minimal — text-to-image / text-to-video
 result = visual_gen.generate("A cat on a windowsill")
 
 # With params
@@ -286,10 +332,19 @@ results = visual_gen.generate(
     params=[VisualGenParams(height=480), VisualGenParams(height=720)],
 )
 
-# With conditioning (image/mask on params, not on prompt)
+# Image-to-video — image is part of the input, not a param
 result = visual_gen.generate(
-    "Make it snow",
-    params=VisualGenParams(image="summer.png", num_frames=81),
+    VisualGenInputs(prompt="Make it snow", image="summer.png"),
+    params=VisualGenParams(num_frames=81),
+)
+
+# Batch with per-request images (naturally supported)
+results = visual_gen.generate(
+    [
+        VisualGenInputs(prompt="Cat jumps", image="cat.png"),
+        VisualGenInputs(prompt="Dog runs", image="dog.png"),
+    ],
+    params=VisualGenParams(num_frames=81),  # shared generation settings
 )
 ```
 
@@ -299,11 +354,13 @@ result = visual_gen.generate(
 
 [`VisualGenParams`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L433-L438) hardcodes: `height=720`, `width=1280`, `num_inference_steps=50`, `guidance_scale=5.0`, `max_sequence_length=512`, `seed=42`. These are wrong for most models:
 
-| Model | Ideal height | Ideal width | guidance_scale | num_inference_steps |
-|-------|-------------|-------------|----------------|---------------------|
-| Wan 1.3B | 480 | 832 | 5.0 | 50 |
-| FLUX.2 | 1024 | 1024 | 0.0 (distilled) | 28 |
-| LTX-2 | 768 | 1280 | varies | varies |
+
+| Model    | Ideal height | Ideal width | guidance_scale  | num_inference_steps |
+| -------- | ------------ | ----------- | --------------- | ------------------- |
+| Wan 1.3B | 480          | 832         | 5.0             | 50                  |
+| FLUX.2   | 1024         | 1024        | 0.0 (distilled) | 28                  |
+| LTX-2    | 768          | 1280        | varies          | varies              |
+
 
 #### Recommendation
 
@@ -324,23 +381,28 @@ class VisualGenParams:
     num_frames: Optional[int] = None            # None → model default (1 for image, 81 for video)
     frame_rate: Optional[float] = None
 
-    # Common optional params
-    negative_prompt: Optional[str] = None
+    # Conditioning strength params
+    image_cond_strength: Optional[float] = None # how strongly image conditioning influences output
     num_images_per_prompt: int = 1              # 1 is always sensible as default
 
     # Model-specific params (see §4.3)
     extra_params: Optional[Dict[str, Any]] = None
+
+    # NOTE: negative_prompt and image live on VisualGenInputs (§4.1),
+    # not here — they specify WHAT to generate, not HOW.
 ```
 
 #### 4.2.1 `seed` Default: Deterministic vs Random
 
 The current default is `seed=42` (deterministic). Making `seed=None` (random) the default means every existing user who relied on reproducible output — even unknowingly — gets different results on every run. This is exactly the kind of "minimal surprise" violation the design principles call out.
 
-| Option | Default | Behavior |
-|--------|---------|----------|
-| **Keep `seed=42`** | Deterministic | Safe for prototype→stable transition; user must opt into randomness |
-| **`seed=None` (random)** | Non-deterministic | Matches diffusers convention; more "production-like" |
-| **`seed=0`** | Deterministic but arbitrary | Signals "we pick a seed" without implying `42` is special |
+
+| Option                   | Default                     | Behavior                                                            |
+| ------------------------ | --------------------------- | ------------------------------------------------------------------- |
+| **Keep `seed=42`**       | Deterministic               | Safe for prototype→stable transition; user must opt into randomness |
+| `**seed=None` (random)** | Non-deterministic           | Matches diffusers convention; more "production-like"                |
+| `**seed=0`**             | Deterministic but arbitrary | Signals "we pick a seed" without implying `42` is special           |
+
 
 **Recommendation**: Keep a deterministic default (either `42` or `0`) for the graduation. Require `seed=None` for explicit randomness. The `seed_used` field on `VisualGenOutput` (§6.1) makes the actual seed discoverable either way.
 
@@ -363,17 +425,20 @@ Each `BasePipeline` subclass implements `default_generation_params() → dict` t
 #### The Problem
 
 With `extra_params: dict`, how does the user know:
+
 - What keys are valid for the loaded model?
 - What types and ranges are expected?
 - What the defaults are?
 
 #### How Others Handle This
 
-| Framework | Approach | Discoverability |
-|-----------|----------|-----------------|
-| **Diffusers** | Per-pipeline `__call__` docstring + type hints | IDE completion ✓, but only if you know the pipeline class |
-| **SGLang** | Model subclass with typed fields | IDE completion ✓, but must import the right subclass |
-| **vLLM-omni** | "Incompatible values will result in errors from the underlying pipeline" | No discoverability ✗ |
+
+| Framework     | Approach                                                                 | Discoverability                                           |
+| ------------- | ------------------------------------------------------------------------ | --------------------------------------------------------- |
+| **Diffusers** | Per-pipeline `__call__` docstring + type hints                           | IDE completion ✓, but only if you know the pipeline class |
+| **SGLang**    | Model subclass with typed fields                                         | IDE completion ✓, but must import the right subclass      |
+| **vLLM-omni** | "Incompatible values will result in errors from the underlying pipeline" | No discoverability ✗                                      |
+
 
 #### Recommendation: Three-Layer Approach
 
@@ -381,12 +446,14 @@ The examples below use a type called `ExtraParamSchema` to describe each extra p
 
 #### Naming: `ExtraParamSchema`
 
-| Option | Name | Rationale |
-|--------|------|-----------|
-| **A** | `ParamSpec` | Short and descriptive. But **collides with `typing.ParamSpec`** (PEP 612), a well-known Python typing construct with completely different semantics. Would confuse static analysis tools and developers. |
-| **B** | `ExtraParamSchema` | Descriptive — it's a schema describing an extra parameter. No collisions. |
-| **C** | `ParamDescriptor` | Descriptive, but "descriptor" has its own Python meaning (`__get__`/`__set__` protocol). |
-| **D** | `ParamDefinition` | Clear, but less conventional in API contexts where "schema" is the standard term. |
+
+| Option | Name               | Rationale                                                                                                                                                                                                |
+| ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A**  | `ParamSpec`        | Short and descriptive. But **collides with `typing.ParamSpec`** (PEP 612), a well-known Python typing construct with completely different semantics. Would confuse static analysis tools and developers. |
+| **B**  | `ExtraParamSchema` | Descriptive — it's a schema describing an extra parameter. No collisions.                                                                                                                                |
+| **C**  | `ParamDescriptor`  | Descriptive, but "descriptor" has its own Python meaning (`__get__`/`__set__` protocol).                                                                                                                 |
+| **D**  | `ParamDefinition`  | Clear, but less conventional in API contexts where "schema" is the standard term.                                                                                                                        |
+
 
 **Recommendation**: **Option B — `ExtraParamSchema`**. Avoids the `typing.ParamSpec` collision, is self-describing, and follows the convention of "schema" for type/validation metadata.
 
@@ -446,12 +513,11 @@ class DiffusionRequest:
     negative_prompt: Optional[str]
     params: VisualGenParams  # embed the whole object instead of field-by-field copy
     image: Optional[Union[str, List[str]]] = None
-    mask: Optional[str] = None
 ```
 
 This eliminates the field-by-field copy and ensures the internal request always carries the full params. The pipeline's `infer()` method reads from `request.params` instead of top-level fields.
 
-> **Future work**: The `Diffusion` prefix on internal types (`DiffusionRequest`, `DiffusionResponse`, `DiffusionExecutor`, `DiffusionModelConfig`, etc.) leaks an implementation detail while the product brand is `VisualGen`. No peer framework uses "Diffusion" as a prefix either — SGLang uses `GenerateReqInput`, vLLM-omni uses `OmniDiffusionRequest`, TRT-LLM LLM uses `GenerationRequest`. These internal types should be renamed to `VisualGen*` in a follow-up pass once the API-facing renames are settled. See §10.3 for the full rename map.
+> **Future work**: The `Diffusion` prefix on internal types (`DiffusionRequest`, `DiffusionResponse`, `DiffusionExecutor`, `DiffusionModelConfig`, etc.) leaks an implementation detail while the product brand is `VisualGen`. No peer framework uses "Diffusion" as a prefix either — SGLang uses `GenerateReqInput`, vLLM-omni uses `OmniDiffusionRequest`, TRT-LLM LLM uses `GenerationRequest`. These internal types should be renamed to `VisualGen`* in a follow-up pass once the API-facing renames are settled. See §10.3 for the full rename map.
 
 ---
 
@@ -472,9 +538,9 @@ class VisualGen:
 
         Args:
             prompt: Text prompt string or list of prompt strings.
-            params: Generation parameters (including conditioning inputs
-                    like image, mask, negative_prompt). None = model defaults.
-                    Single params shared across batch, or per-request list.
+            params: Generation parameters (resolution, steps, guidance, seed, etc.).
+                    None = model defaults. Single params shared across batch,
+                    or per-request list.
 
         Returns:
             Single VisualGenOutput or list (matching prompt shape).
@@ -509,12 +575,14 @@ The [current async handle](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4
 1. **"Diffusion" prefix** — being eliminated across the codebase (see §10.3). The product brand is `VisualGen`.
 2. **"Result" suffix** — the object is an async handle (a future), not a result itself. `result()` is a *method* on the handle. The LLM API uses `GenerationResult` for this role, but "Result" conflates the handle with the value it produces.
 
-| Option | Name | Rationale |
-|--------|------|-----------|
-| **A** | `VisualGenResult` | Matches LLM API's `GenerationResult` pattern. But inherits the "Result" ambiguity. |
-| **B** | `VisualGenResult` | Clarifies async semantics — this is a future/handle, not the result itself. Matches Python's `asyncio.Future` convention. |
-| **C** | `VisualGenGenerationResult` | Verbose. Adds nothing over option A. |
-| **D** | `VisualGenAsyncHandle` | Descriptive but unusual — no Python library uses "Handle" for this pattern. |
+
+| Option | Name                        | Rationale                                                                                                                 |
+| ------ | --------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **A**  | `VisualGenResult`           | Matches LLM API's `GenerationResult` pattern. But inherits the "Result" ambiguity.                                        |
+| **B**  | `VisualGenResult`           | Clarifies async semantics — this is a future/handle, not the result itself. Matches Python's `asyncio.Future` convention. |
+| **C**  | `VisualGenGenerationResult` | Verbose. Adds nothing over option A.                                                                                      |
+| **D**  | `VisualGenAsyncHandle`      | Descriptive but unusual — no Python library uses "Handle" for this pattern.                                               |
+
 
 **Recommendation**: **Option A — `VisualGenResult`**. This matches the established convention: TRT-LLM LLM uses `GenerationResult`, SGLang uses `GenerationResult` — neither highlights async behavior in the type name despite both being async handles. Consistency with peer frameworks outweighs the semantic precision of `Future`. The `VisualGen*` prefix avoids collision with the LLM API's `GenerationResult`.
 
@@ -621,6 +689,7 @@ class VisualGenMetrics:
 ```
 
 Why these fields:
+
 - `seed_used`: When user passes `seed=None` (random), they need to know the actual seed to reproduce results.
 - `prompt`: Useful for correlating results in batch scenarios and logging.
 - `metrics`: Essential for production performance analysis. The pipeline already has timing data internally. The breakdown (`queue_ms`, `preprocess_ms`, `inference_ms`, `postprocess_ms`, `total_ms`) uses abstract names that don't leak pipeline internals — `preprocess_ms` covers input preparation (e.g., text encoding) and `postprocess_ms` covers output conversion (e.g., latent decoding), so the fields stay meaningful across different backends and modalities. And also enables benchmarking per-step metric from the user side.
@@ -630,21 +699,25 @@ Why these fields:
 
 **For the wrapper type:**
 
-| Option | Name | Rationale |
-|--------|------|-----------|
-| **A** | `GenerationOutput` | Generic. But collides with potential LLM API types — `GenerationResult` already exists there. |
-| **B** | `RequestOutput` | Matches LLM API naming. But would collide with `tensorrt_llm.llmapi.RequestOutput` if both are imported. |
-| **C** | `VisualGenOutput` | Brand-prefixed. Avoids all collisions. Consistent with `VisualGenArgs`, `VisualGenParams`. |
-| **D** | `MediaGenerationOutput` | Modality-specific but verbose. |
+
+| Option | Name                    | Rationale                                                                                                |
+| ------ | ----------------------- | -------------------------------------------------------------------------------------------------------- |
+| **A**  | `GenerationOutput`      | Generic. But collides with potential LLM API types — `GenerationResult` already exists there.            |
+| **B**  | `RequestOutput`         | Matches LLM API naming. But would collide with `tensorrt_llm.llmapi.RequestOutput` if both are imported. |
+| **C**  | `VisualGenOutput`       | Brand-prefixed. Avoids all collisions. Consistent with `VisualGenArgs`, `VisualGenParams`.               |
+| **D**  | `MediaGenerationOutput` | Modality-specific but verbose.                                                                           |
+
 
 **Recommendation**: **Option C — `VisualGenOutput`**. The `VisualGen*` prefix avoids namespace collisions in a codebase where users commonly `from tensorrt_llm import LLM, VisualGen`. The LLM API already has `RequestOutput` and `GenerationResult`, so generic names risk ambiguity. `MediaOutput` stays as-is — it's already modality-specific and doesn't collide.
 
 **For the metrics type:**
 
-| Option | Name | Rationale |
-|--------|------|-----------|
-| **A** | `GenerationMetrics` | Generic. Could be confused with LLM metrics. |
-| **B** | `VisualGenMetrics` | Consistent with the `VisualGen*` prefix convention. Aligns with SGLang (`RequestMetrics`) and vLLM-Omni (`RequestE2EStats`) naming — `metrics` is the ecosystem-standard term for this data, which naturally extends beyond pure timing to include memory, throughput, etc. |
+
+| Option | Name                | Rationale                                                                                                                                                                                                                                                                   |
+| ------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A**  | `GenerationMetrics` | Generic. Could be confused with LLM metrics.                                                                                                                                                                                                                                |
+| **B**  | `VisualGenMetrics`  | Consistent with the `VisualGen*` prefix convention. Aligns with SGLang (`RequestMetrics`) and vLLM-Omni (`RequestE2EStats`) naming — `metrics` is the ecosystem-standard term for this data, which naturally extends beyond pure timing to include memory, throughput, etc. |
+
 
 **Recommendation**: **Option B — `VisualGenMetrics`**. Follows the same prefix convention as `VisualGenOutput`.
 
@@ -719,9 +792,10 @@ class MediaOutput:
 ```
 
 Key design decisions:
-- **`save()` infers format from extension** (like [`MediaStorage.save_video`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/serve/media_storage.py#L660-L663) already does), with `format` override.
-- **`to_bytes()` requires explicit format** — no path to infer from, so must be explicit.
-- **`metadata` dict carries `frame_rate`** from generation, so `save("output.mp4")` works without specifying frame_rate again. User can override.
+
+- `**save()` infers format from extension** (like [`MediaStorage.save_video`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/serve/media_storage.py#L660-L663) already does), with `format` override.
+- `**to_bytes()` requires explicit format** — no path to infer from, so must be explicit.
+- `**metadata` dict carries `frame_rate`** from generation, so `save("output.mp4")` works without specifying frame_rate again. User can override.
 - **Audio muxing is automatic**: If `video` and `audio` are both populated, `save("output.mp4")` muxes them together (MP4+AAC). This matches user expectation for LTX-2 outputs.
 - **Dependencies are lazy-imported**: PIL, ffmpeg are imported only when `save()`/`to_pil()`/`to_bytes()` are called.
 
@@ -800,12 +874,14 @@ Currently, errors surface as `RuntimeError(f"Generation failed: {response.error_
 
 All three frameworks use raise-on-error (no error fields on result objects) and have minimal exception hierarchies:
 
-| Aspect | TRT-LLM LLM API | vLLM-Omni | SGLang Diffusion |
-|--------|-----------------|-----------|------------------|
-| **Error model** | Raise-on-error | Raise-on-error | Log-and-continue (per-prompt in batch) |
-| **Custom exceptions** | `RequestError(RuntimeError)` — flat, no `LLMError` base | `VLLMValidationError(ValueError)` — not diffusion-specific | None |
-| **Error on result object** | No | No | No |
-| **Runtime error type** | `RequestError` (via background handler) | Bare `Exception` | Bare `Exception` |
+
+| Aspect                     | TRT-LLM LLM API                                         | vLLM-Omni                                                  | SGLang Diffusion                       |
+| -------------------------- | ------------------------------------------------------- | ---------------------------------------------------------- | -------------------------------------- |
+| **Error model**            | Raise-on-error                                          | Raise-on-error                                             | Log-and-continue (per-prompt in batch) |
+| **Custom exceptions**      | `RequestError(RuntimeError)` — flat, no `LLMError` base | `VLLMValidationError(ValueError)` — not diffusion-specific | None                                   |
+| **Error on result object** | No                                                      | No                                                         | No                                     |
+| **Runtime error type**     | `RequestError` (via background handler)                 | Bare `Exception`                                           | Bare `Exception`                       |
+
 
 None have invested in a diffusion-specific exception hierarchy.
 
@@ -840,30 +916,24 @@ VisualGen has no tracing support. The LLM API has full OpenTelemetry (OTLP) inte
 **How the LLM API does it:**
 
 1. **Configuration** — `LlmArgs.otlp_traces_endpoint` (optional URL). On init, `LLM.__init__()` calls `tracing.init_tracer("trt.llm", endpoint)` to set up a `TracerProvider` with a `BatchSpanProcessor`.
-
 2. **Header propagation** — `LLM.generate_async()` accepts `trace_headers: Mapping[str, str]`. The serving layer (`openai_server.py`) extracts `traceparent`/`tracestate` from incoming HTTP headers and passes them through. The headers are stored on `GenerationResult.trace_headers`.
-
 3. **Span creation** — When a request completes, `GenerationResultBase.do_tracing()` creates a span named `"llm_request"` with `SpanKind.SERVER`, rooted in the caller's trace context. It records:
-   - Request attributes: `temperature`, `top_p`, `top_k`, `max_tokens`, `n`, `request_id`
-   - Usage: `prompt_tokens`, `completion_tokens`
-   - Latency: `time_to_first_token`, `e2e`, `time_in_queue`, `kv_cache_transfer_time`
-   - Events: `kv_cache_transfer_start`/`end` with timestamps
-
+  - Request attributes: `temperature`, `top_p`, `top_k`, `max_tokens`, `n`, `request_id`
+  - Usage: `prompt_tokens`, `completion_tokens`
+  - Latency: `time_to_first_token`, `e2e`, `time_in_queue`, `kv_cache_transfer_time`
+  - Events: `kv_cache_transfer_start`/`end` with timestamps
 4. **Key files** — `llmapi/tracing.py` (tracer init, span utilities, `SpanAttributes` enum), `executor/result.py` (`do_tracing()` on `GenerationResultBase`).
 
 **What VisualGen would need:**
 
-1. **`VisualGenArgs.otlp_traces_endpoint`** — reuse the same `tracing.init_tracer()` from `llmapi/tracing.py` (no need to duplicate).
-
-2. **`trace_headers` on `VisualGen.generate()`** — pass through to `VisualGenResult`, same as the LLM API pattern.
-
+1. `**VisualGenArgs.otlp_traces_endpoint`** — reuse the same `tracing.init_tracer()` from `llmapi/tracing.py` (no need to duplicate).
+2. `**trace_headers` on `VisualGen.generate()**` — pass through to `VisualGenResult`, same as the LLM API pattern.
 3. **Visual-gen-specific `SpanAttributes`** — diffusion has different metrics than LLM (no TTFT or token counts). Relevant attributes:
-   - `gen_ai.request.id`, `gen_ai.request.model`
-   - `visual_gen.resolution` (height x width), `visual_gen.num_frames`
-   - `visual_gen.num_inference_steps`, `visual_gen.guidance_scale`
-   - `visual_gen.latency.e2e`, `visual_gen.latency.pipeline` (denoising), `visual_gen.latency.encoding`
-
-4. **`do_tracing()` on `VisualGenResult`** — create a `"visual_gen_request"` span on completion, analogous to the LLM's `"llm_request"` span.
+  - `gen_ai.request.id`, `gen_ai.request.model`
+  - `visual_gen.resolution` (height x width), `visual_gen.num_frames`
+  - `visual_gen.num_inference_steps`, `visual_gen.guidance_scale`
+  - `visual_gen.latency.e2e`, `visual_gen.latency.pipeline` (denoising), `visual_gen.latency.encoding`
+4. `**do_tracing()` on `VisualGenResult**` — create a `"visual_gen_request"` span on completion, analogous to the LLM's `"llm_request"` span.
 
 **Recommendation** (future): Reuse `llmapi/tracing.py` infrastructure (tracer init, span export, context propagation). Add visual-gen-specific span attributes and a `do_tracing()` method on the result type. This is additive and non-breaking — defer until serving-side observability is a priority.
 
@@ -877,10 +947,8 @@ We do NOT implement streaming now, but the API shape must be forward-compatible.
 
 Rather than designing a complex chunk/stream protocol now, we ensure the API shapes accommodate it:
 
-1. **`VisualGenOutput.finished: bool`** — Today always `True`. In streaming mode, intermediate outputs have `finished=False`.
-
-2. **`generate()` returns `VisualGenOutput`, not raw `MediaOutput`** — The wrapper gives room for metadata.
-
+1. `**VisualGenOutput.finished: bool`** — Today always `True`. In streaming mode, intermediate outputs have `finished=False`.
+2. `**generate()` returns `VisualGenOutput`, not raw `MediaOutput**` — The wrapper gives room for metadata.
 3. **Future `stream()` method**:
 
 ```python
@@ -898,9 +966,8 @@ async def stream(
     """
 ```
 
-4. **No `ChunkType` enum needed**: The `VisualGenOutput` wrapper already tells the consumer what modalities are populated (check `output.video is not None`, `output.audio is not None`). A progress field (`VisualGenOutput.progress: float`) gives 0→1 visibility.
-
-5. **Non-streaming `generate()` wraps `stream()` internally** in the future:
+1. **No `ChunkType` enum needed**: The `VisualGenOutput` wrapper already tells the consumer what modalities are populated (check `output.video is not None`, `output.audio is not None`). A progress field (`VisualGenOutput.progress: float`) gives 0→1 visibility.
+2. **Non-streaming `generate()` wraps `stream()` internally** in the future:
 
 ```python
 def generate(self, inputs, params):
@@ -940,7 +1007,7 @@ tensorrt_llm/
 
 ### Three Options (Elaborated)
 
-> **Note**: The directory listings below use proposed type names from earlier sections (`VisualGenOutput` from §6.1, `VisualGenResult` from §5.2). Internal types keep their current `Diffusion*` names (see §4.4 future work note).
+> **Note**: The directory listings below use proposed type names from earlier sections (`VisualGenOutput` from §6.1, `VisualGenResult` from §5.2). Internal types keep their current `Diffusion`* names (see §4.4 future work note).
 
 #### Option A: New top-level `visualgenapi/` (parallel to `llmapi/`)
 
@@ -968,6 +1035,7 @@ tensorrt_llm/
 Note: `VisualGenArgs` moves to `visualgenapi/` (or `llmapi/`, see §3.1), not staying in `_torch/`. This is consistent with the LLM API pattern where `BaseLlmArgs`/`TrtLlmArgs`/`TorchLlmArgs` all live in `llmapi/llm_args.py`, not in `_torch/`.
 
 Pros:
+
 - Cleanest separation of public vs internal.
 - `visualgenapi/` is the "boundary" — everything inside `_torch/visual_gen/` is explicitly internal.
 - Mirrors the `llmapi/` / `_torch/` split that exists for LLM.
@@ -975,6 +1043,7 @@ Pros:
 - **Code ownership**: The VisualGen team can own `visualgenapi/` independently. Changes don't require `llmapi-dev` review, which is focused on LLM APIs.
 
 Cons:
+
 - New top-level module. Changes to `__init__.py`, CI, docs.
 - VisualGen is still small (1 class, 2-3 supporting types). A whole module may be premature.
 - `from tensorrt_llm import VisualGen` still works (via `__init__.py`), so users don't care about the internal module name.
@@ -1001,11 +1070,13 @@ tensorrt_llm/
 ```
 
 Pros:
+
 - Minimal structural change. Just rename/reorganize within existing modules.
 - Pragmatic — VisualGen IS an API alongside LLM; sharing `llmapi/` is reasonable.
 - Underscore prefix on internal files (`_visual_gen_client.py`) is enough.
 
 Cons:
+
 - `llmapi/` name implies "LLM API". Having VisualGen there is semantically odd.
 - As VisualGen grows, `llmapi/` becomes a dumping ground.
 - **Code ownership friction**: `llmapi/` is owned by the `llmapi-dev` team, which is focused on LLM APIs. VisualGen changes in `llmapi/` would require their review, adding process overhead for the VisualGen team and review burden for `llmapi-dev` reviewers who may lack VisualGen context.
@@ -1031,12 +1102,14 @@ tensorrt_llm/
 ```
 
 Pros:
+
 - `tensorrt_llm.visual_gen` is a natural, discoverable namespace.
 - Not inside `llmapi/` — no semantic confusion.
 - Not inside `_torch/` — clearly public.
 - **Code ownership**: Like Option A, the VisualGen team can own `visual_gen/` independently without requiring `llmapi-dev` review.
 
 Cons:
+
 - Could conflict with `_torch/visual_gen/` naming (both are "visual_gen").
 - Import paths like `from tensorrt_llm.visual_gen import VisualGen` vs `tensorrt_llm._torch.visual_gen.config import VisualGenArgs` — the duplication may confuse contributors.
 
@@ -1045,6 +1118,7 @@ Cons:
 **Option B now, Option A as a future milestone.**
 
 Rationale:
+
 - Option B is the minimum viable change. It clarifies public vs internal without module restructuring.
 - The key improvement: `llmapi/__init__.py` explicitly lists what's public; internal types get underscore prefixes.
 - The code ownership concern (VisualGen changes requiring `llmapi-dev` review) is real but manageable short-term — the VisualGen surface in `llmapi/` is small and well-scoped.
@@ -1061,13 +1135,15 @@ This section covers naming holistically — from the top-level "brand name" down
 
 The current name `VisualGen` was chosen to be modality-agnostic across image and video. But LTX-2 also generates **audio**. And future models may generate 3D meshes, point clouds, or other non-visual media.
 
-| Candidate | Covers Image? | Covers Video? | Covers Audio? | Covers 3D? | Ecosystem precedent |
-|-----------|:---:|:---:|:---:|:---:|-----|
-| `VisualGen` | ✓ | ✓ | ✗ | ✗ | — |
-| `MediaGen` | ✓ | ✓ | ✓ | ✓ | — |
-| `DiffusionEngine` | ✓ | ✓ | ✓ | ✓ | SGLang, vLLM-omni use "diffusion" internally |
-| `MultiModalGen` | ✓ | ✓ | ✓ | ✓ | vLLM-omni: `multimodal_gen` |
-| `GenerativeEngine` | ✓ | ✓ | ✓ | ✓ | Too generic |
+
+| Candidate          | Covers Image? | Covers Video? | Covers Audio? | Covers 3D? | Ecosystem precedent                          |
+| ------------------ | ------------- | ------------- | ------------- | ---------- | -------------------------------------------- |
+| `VisualGen`        | ✓             | ✓             | ✗             | ✗          | —                                            |
+| `MediaGen`         | ✓             | ✓             | ✓             | ✓          | —                                            |
+| `DiffusionEngine`  | ✓             | ✓             | ✓             | ✓          | SGLang, vLLM-omni use "diffusion" internally |
+| `MultiModalGen`    | ✓             | ✓             | ✓             | ✓          | vLLM-omni: `multimodal_gen`                  |
+| `GenerativeEngine` | ✓             | ✓             | ✓             | ✓          | Too generic                                  |
+
 
 **Discussion:**
 
@@ -1082,17 +1158,19 @@ The current name `VisualGen` was chosen to be modality-agnostic across image and
 
 Establish explicit patterns that mirror the LLM API. The goal: a user who knows the LLM API can predict VisualGen class names.
 
-| Suffix | Role | LLM API Example | VisualGen Example |
-|--------|------|-----------------|-------------------|
-| `*Args` | Engine/model loading config (init-time) | `LlmArgs`, `TorchLlmArgs`, `TrtLlmArgs` | `VisualGenArgs` |
-| `*Config` | Sub-configuration objects (composable, nested) | `KvCacheConfig`, `CudaGraphConfig`, `SchedulerConfig` | `ParallelConfig`, `CompilationConfig`, `AttentionConfig` |
-| `*Params` | Per-request generation parameters | `SamplingParams` | `VisualGenParams` |
-| `*Output` | User-facing result objects | `RequestOutput`, `CompletionOutput` | `VisualGenOutput`, `MediaOutput` |
-| `*Result` | Async result handles | `GenerationResult` | `VisualGenResult` (renamed from `DiffusionGenerationResult`) |
-| `*Request` | Internal wire format (not user-facing) | — (internal) | `DiffusionRequest` (keep for now, rename deferred — see §4.4) |
-| `*Response` | Internal wire format (not user-facing) | — (internal) | `DiffusionResponse` (keep for now) |
-| `*Error` | Exception types | — | `VisualGenError`, `InvalidParamsError`, etc. |
-| `*Prompt` | Input type dicts | `TextPrompt`, `TokensPrompt` | N/A — prompt is plain `str` (see §4.1) |
+
+| Suffix      | Role                                           | LLM API Example                                       | VisualGen Example                                             |
+| ----------- | ---------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------- |
+| `*Args`     | Engine/model loading config (init-time)        | `LlmArgs`, `TorchLlmArgs`, `TrtLlmArgs`               | `VisualGenArgs`                                               |
+| `*Config`   | Sub-configuration objects (composable, nested) | `KvCacheConfig`, `CudaGraphConfig`, `SchedulerConfig` | `ParallelConfig`, `CompilationConfig`, `AttentionConfig`      |
+| `*Params`   | Per-request generation parameters              | `SamplingParams`                                      | `VisualGenParams`                                             |
+| `*Output`   | User-facing result objects                     | `RequestOutput`, `CompletionOutput`                   | `VisualGenOutput`, `MediaOutput`                              |
+| `*Result`   | Async result handles                           | `GenerationResult`                                    | `VisualGenResult` (renamed from `DiffusionGenerationResult`)  |
+| `*Request`  | Internal wire format (not user-facing)         | — (internal)                                          | `DiffusionRequest` (keep for now, rename deferred — see §4.4) |
+| `*Response` | Internal wire format (not user-facing)         | — (internal)                                          | `DiffusionResponse` (keep for now)                            |
+| `*Error`    | Exception types                                | —                                                     | `VisualGenError`, `InvalidParamsError`, etc.                  |
+| `*Prompt`   | Input type dicts                               | `TextPrompt`, `TokensPrompt`                          | N/A — prompt is plain `str` (see §4.1)                        |
+
 
 **Key rule: Internal types live in internal modules.** The `_torch/visual_gen/` module path signals "internal." Internal types keep their current `Diffusion*` names for now; renaming them to `VisualGen*` is deferred as future work (see §4.4).
 
@@ -1102,26 +1180,30 @@ Establish explicit patterns that mirror the LLM API. The goal: a user who knows 
 
 Currently, seven classes use the `Diffusion` prefix. **This refactor only renames the public API type** (`DiffusionGenerationResult`). Internal types keep their current names for now — renaming them is deferred as future work (see §4.4).
 
-| Current | Visibility | Action | Rationale |
-|---------|-----------|--------|-----------|
-| [`DiffusionGenerationResult`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L366) | **Public** | **Rename → `VisualGenResult`** | See §5.2 for naming options. |
-| [`DiffusionRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L20) | Internal | Keep (future work) | Defer — refactor `params` embedding first (§4.4) |
-| [`DiffusionResponse`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L63) | Internal | Keep (future work) | Defer |
-| [`DiffusionExecutor`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L77) | Internal | Keep (future work) | Defer |
-| [`DiffusionRemoteClient`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L52) | Internal | Keep (future work) | Defer |
-| [`DiffusionModelConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/config.py#L468) | Internal | Keep (future work) | Defer |
-| [`DiffusionStepProtocol`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/models/ltx2/ltx2_core/protocols.py#L36) | Internal (deep) | Keep (future work) | Defer |
+
+| Current                                                                                                                                                                               | Visibility      | Action                         | Rationale                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ------------------------------ | ------------------------------------------------ |
+| [`DiffusionGenerationResult`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L366)                            | **Public**      | **Rename → `VisualGenResult`** | See §5.2 for naming options.                     |
+| [`DiffusionRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L20)                             | Internal        | Keep (future work)             | Defer — refactor `params` embedding first (§4.4) |
+| [`DiffusionResponse`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L63)                            | Internal        | Keep (future work)             | Defer                                            |
+| [`DiffusionExecutor`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/executor.py#L77)                            | Internal        | Keep (future work)             | Defer                                            |
+| [`DiffusionRemoteClient`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/llmapi/visual_gen.py#L52)                                 | Internal        | Keep (future work)             | Defer                                            |
+| [`DiffusionModelConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/config.py#L468)                          | Internal        | Keep (future work)             | Defer                                            |
+| [`DiffusionStepProtocol`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/_torch/visual_gen/models/ltx2/ltx2_core/protocols.py#L36) | Internal (deep) | Keep (future work)             | Defer                                            |
+
 
 The related function `run_diffusion_worker` — keep for now (future work).
 
 ### 10.4 `*Args` vs `*Config` Consistency
 
 Currently:
+
 - Engine-level: `VisualGenArgs` (uses `*Args` — matches `LlmArgs`)
 - Sub-configs: `ParallelConfig`, `CompilationConfig`, `AttentionConfig`, `TeaCacheConfig`, `PipelineConfig` (use `*Config`)
 - Internal model config: `DiffusionModelConfig` (uses `*Config`)
 
 This is actually correct and consistent with the LLM API:
+
 - `LlmArgs` → engine config (top-level)
 - `KvCacheConfig`, `CudaGraphConfig`, `SchedulerConfig` → sub-configs
 
@@ -1133,12 +1215,14 @@ However, there's an inconsistency in the **constructor parameter name** (`diffus
 
 In the LLM world, `SamplingParams` controls how tokens are sampled (temperature, top_p, top_k). In diffusion, the analogous concept is "generation parameters" (height, width, steps, guidance_scale, seed). The LLM API's `SamplingParams` name doesn't translate well to diffusion.
 
-| Candidate | Rationale |
-|-----------|-----------|
-| `VisualGenParams` | Current name. Clear, specific. |
+
+| Candidate          | Rationale                                         |
+| ------------------ | ------------------------------------------------- |
+| `VisualGenParams`  | Current name. Clear, specific.                    |
 | `GenerationParams` | More generic. Could apply to LLM too (confusing). |
-| `SamplingParams` | Overloaded with the LLM meaning. |
-| `InferenceParams` | Too generic — "inference" is a broad term. |
+| `SamplingParams`   | Overloaded with the LLM meaning.                  |
+| `InferenceParams`  | Too generic — "inference" is a broad term.        |
+
 
 **Recommendation**: Keep `VisualGenParams`. It's clear, specific to visual generation, and doesn't collide with `SamplingParams`. The `VisualGen*` prefix is the brand identifier.
 
@@ -1146,44 +1230,50 @@ In the LLM world, `SamplingParams` controls how tokens are sampled (temperature,
 
 The naming decisions for `VisualGenOutput`, `VisualGenMetrics`, and `VisualGenResult` are discussed in context where these types are first introduced:
 
-- **`VisualGenOutput` and `VisualGenMetrics`** — see §6.1 for motivation, options, and recommendation.
-- **`VisualGenResult`** — see §5.2 for motivation, options, and recommendation.
+- `**VisualGenOutput` and `VisualGenMetrics`** — see §6.1 for motivation, options, and recommendation.
+- `**VisualGenResult**` — see §5.2 for motivation, options, and recommendation.
 
 For a consolidated view of how these map to the LLM API:
 
-| LLM API | VisualGen API | Role | Discussion |
-|---------|---------------|------|------------|
-| `CompletionOutput` | `MediaOutput` (keep) | The generated content | — |
-| `RequestOutput` | `VisualGenOutput` (NEW) | Request-level wrapper with metadata | §6.1 |
-| `GenerationResult` | `VisualGenResult` (renamed) | Async handle | §5.2 |
+
+| LLM API            | VisualGen API               | Role                                | Discussion |
+| ------------------ | --------------------------- | ----------------------------------- | ---------- |
+| `CompletionOutput` | `MediaOutput` (keep)        | The generated content               | —          |
+| `RequestOutput`    | `VisualGenOutput` (NEW)     | Request-level wrapper with metadata | §6.1       |
+| `GenerationResult` | `VisualGenResult` (renamed) | Async handle                        | §5.2       |
+
 
 ### 10.7 Input Type Naming
 
 Current:
+
 - `VisualGenTextPrompt` — a `TypedDict` with `prompt` and optional `negative_prompt`
 - `VisualGenTokensPrompt` — a `TypedDict` with `prompt_token_ids`
 - `VisualGenPromptInputs` — union type
 - `VisualGenInputs` — union including batch
 
 **Issues:**
-- With the decision to use plain `str` as the prompt type (§4.1 Option B), none of these structured input types are needed in the public API.
-- Conditioning inputs (negative_prompt, image, mask) live on `VisualGenParams`, not on a prompt dict.
-- `VisualGenTokensPrompt` exposes token IDs, which is an LLM concept — diffusion text encoders handle tokenization internally.
 
-**Recommendation**: Drop all four types from the public API:
-- `VisualGenTextPrompt` — no longer needed; prompt is `str`
+- The current `VisualGenInputs` is a thin union alias that adds no value beyond `str`. It should be replaced by a proper structured type that carries all creative-intent inputs (prompt, negative_prompt, image).
+- `VisualGenTokensPrompt` exposes token IDs, which is an LLM concept — diffusion text encoders handle tokenization internally.
+- `VisualGenTextPrompt` is a `TypedDict` with only `prompt` and `negative_prompt` — too thin and doesn't carry conditioning inputs.
+
+**Recommendation**: Replace the four current types with a single `VisualGenInputs` class (see §4.1 Option C):
+
+- `VisualGenTextPrompt` — drop; replaced by `VisualGenInputs.prompt`
 - `VisualGenTokensPrompt` — drop; raw token IDs are not a user-facing concept for visual generation
-- `VisualGenPromptInputs` — drop; the union simplifies to `Union[str, List[str]]` inline
-- `VisualGenInputs` — drop; same reason
-- Remove from `inputs/data.py`; if any internal code still needs structured prompt dicts, use underscore-prefixed internal types
+- `VisualGenPromptInputs` — drop; replaced by `Union[str, VisualGenInputs]` inline
+- `VisualGenInputs` — **repurpose** as a proper dataclass/Pydantic model carrying `prompt`, `negative_prompt`, `image`, and future multimodal inputs (mask for inpainting, video, style_image, etc.)
+- Remove old types from `inputs/data.py`; define the new `VisualGenInputs` in `llmapi/visual_gen.py` alongside `VisualGenParams`
 
 ### 10.8 Benchmark/Serving Helper Naming
 
 The codebase also has:
+
 - [`VisualGenRequestInput`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/serve/scripts/benchmark_visual_gen.py#L67) in `serve/scripts/benchmark_visual_gen.py`
 - [`VisualGenSampleRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/bench/benchmark/visual_gen_utils.py#L28), [`VisualGenRequestOutput`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/bench/benchmark/visual_gen_utils.py#L35), [`VisualGenBenchmarkMetrics`](https://github.com/NVIDIA/TensorRT-LLM/blob/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90/tensorrt_llm/bench/benchmark/visual_gen_utils.py#L47) in `bench/`
 
-These are consistent with the `VisualGen*` brand. No changes needed, but they should evolve if the core types are renamed (e.g., if `VisualGenRequestOutput` wraps the new `VisualGenOutput`).
+These are consistent with the `VisualGen`* brand. No changes needed, but they should evolve if the core types are renamed (e.g., if `VisualGenRequestOutput` wraps the new `VisualGenOutput`).
 
 ### 10.9 Pipeline Class Naming (Internal)
 
@@ -1192,6 +1282,7 @@ Current model pipeline classes: `WanPipeline`, `Flux2Pipeline`, `LTX2Pipeline`, 
 These are internal (in `_torch/visual_gen/models/`) and users never see them. The naming is consistent and clear. **No changes needed.**
 
 However, the registry name strings should stay aligned:
+
 ```python
 @register_pipeline("WanPipeline")
 class WanPipeline(BasePipeline): ...
@@ -1199,56 +1290,60 @@ class WanPipeline(BasePipeline): ...
 
 ### 10.10 Summary: Full Rename Map
 
-| Current Name | New Name | Type | File Location |
-|-------------|----------|------|---------------|
-| **Public types** | | | |
-| `VisualGen` | Keep | Class | `llmapi/visual_gen.py` |
-| `VisualGenArgs` | Keep (remove `to_dict`/`from_dict`, see §3.2) | Pydantic model | `llmapi/visual_gen_args.py` (move from `_torch/visual_gen/config.py`, see §3.1) |
-| `VisualGenParams` | Keep (convert to Pydantic `StrictBaseModel`, see §13 Q1) | Pydantic model | `llmapi/visual_gen.py` |
-| `MediaOutput` | Keep (move out of `_torch/`, see §9) | Dataclass | `_torch/visual_gen/output.py` |
-| `DiffusionGenerationResult` | → `VisualGenResult` | Class | `llmapi/visual_gen.py` |
-| `VisualGenTextPrompt` | → Drop (prompt is plain `str`, see §4.1) | TypedDict | `inputs/data.py` |
-| `VisualGenTokensPrompt` | → Drop | TypedDict | `inputs/data.py` |
-| `VisualGenPromptInputs` | → Drop (inline as `Union[str, List[str]]`) | Type alias | — |
-| `VisualGenInputs` | → Drop | Type alias | — |
-| — | `VisualGenOutput` (NEW) | Pydantic model | `llmapi/visual_gen.py` |
-| — | `VisualGenMetrics` (NEW) | Pydantic model | `llmapi/visual_gen.py` |
-| — | `ExtraParamSchema` (NEW) | Pydantic model | `llmapi/visual_gen.py` |
-| **Internal types (rename deferred — see §4.4)** | | | |
-| `DiffusionRequest` | Keep (future: → `VisualGen*`) | Dataclass | `_torch/visual_gen/executor.py` |
-| `DiffusionResponse` | Keep (future) | Dataclass | `_torch/visual_gen/executor.py` |
-| `DiffusionExecutor` | Keep (future) | Class | `_torch/visual_gen/executor.py` |
-| `DiffusionRemoteClient` | Keep (future) | Class | `llmapi/visual_gen.py` |
-| `DiffusionModelConfig` | Keep (future) | Pydantic model | `_torch/visual_gen/config.py` |
-| `run_diffusion_worker` | Keep (future) | Function | `_torch/visual_gen/executor.py` |
-| `MediaStorage` | → Deprecate; encoding moves to `media/encoding.py` | Class | `serve/media_storage.py` |
-| **Constructor params** | | | |
-| `VisualGen(model_path=...)` | → `VisualGen(model=...)` (see §3.4) | Param | `llmapi/visual_gen.py` |
-| `VisualGen(diffusion_args=...)` | → `VisualGen(args=...)` (see §3.3) | Param | `llmapi/visual_gen.py` |
+
+| Current Name                                    | New Name                                                 | Type                   | File Location                                                                   |
+| ----------------------------------------------- | -------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------- |
+| **Public types**                                |                                                          |                        |                                                                                 |
+| `VisualGen`                                     | Keep                                                     | Class                  | `llmapi/visual_gen.py`                                                          |
+| `VisualGenArgs`                                 | Keep (remove `to_dict`/`from_dict`, see §3.2)            | Pydantic model         | `llmapi/visual_gen_args.py` (move from `_torch/visual_gen/config.py`, see §3.1) |
+| `VisualGenParams`                               | Keep (convert to Pydantic `StrictBaseModel`, see §13 Q1) | Pydantic model         | `llmapi/visual_gen.py`                                                          |
+| `MediaOutput`                                   | Keep (move out of `_torch/`, see §9)                     | Dataclass              | `_torch/visual_gen/output.py`                                                   |
+| `DiffusionGenerationResult`                     | → `VisualGenResult`                                      | Class                  | `llmapi/visual_gen.py`                                                          |
+| `VisualGenTextPrompt`                           | → Drop (replaced by `VisualGenInputs`, see §4.1)         | TypedDict              | `inputs/data.py`                                                                |
+| `VisualGenTokensPrompt`                         | → Drop                                                   | TypedDict              | `inputs/data.py`                                                                |
+| `VisualGenPromptInputs`                         | → Drop (inline as `Union[str, VisualGenInputs]`)         | Type alias             | —                                                                               |
+| `VisualGenInputs`                               | → Repurpose as structured inputs class (see §4.1, §10.7) | Type alias → Dataclass | `inputs/data.py` → `llmapi/visual_gen.py`                                       |
+| —                                               | `VisualGenOutput` (NEW)                                  | Pydantic model         | `llmapi/visual_gen.py`                                                          |
+| —                                               | `VisualGenMetrics` (NEW)                                 | Pydantic model         | `llmapi/visual_gen.py`                                                          |
+| —                                               | `ExtraParamSchema` (NEW)                                 | Pydantic model         | `llmapi/visual_gen.py`                                                          |
+| **Internal types (rename deferred — see §4.4)** |                                                          |                        |                                                                                 |
+| `DiffusionRequest`                              | Keep (future: → `VisualGen`*)                            | Dataclass              | `_torch/visual_gen/executor.py`                                                 |
+| `DiffusionResponse`                             | Keep (future)                                            | Dataclass              | `_torch/visual_gen/executor.py`                                                 |
+| `DiffusionExecutor`                             | Keep (future)                                            | Class                  | `_torch/visual_gen/executor.py`                                                 |
+| `DiffusionRemoteClient`                         | Keep (future)                                            | Class                  | `llmapi/visual_gen.py`                                                          |
+| `DiffusionModelConfig`                          | Keep (future)                                            | Pydantic model         | `_torch/visual_gen/config.py`                                                   |
+| `run_diffusion_worker`                          | Keep (future)                                            | Function               | `_torch/visual_gen/executor.py`                                                 |
+| `MediaStorage`                                  | → Deprecate; encoding moves to `media/encoding.py`       | Class                  | `serve/media_storage.py`                                                        |
+| **Constructor params**                          |                                                          |                        |                                                                                 |
+| `VisualGen(model_path=...)`                     | → `VisualGen(model=...)` (see §3.4)                      | Param                  | `llmapi/visual_gen.py`                                                          |
+| `VisualGen(diffusion_args=...)`                 | → `VisualGen(args=...)` (see §3.3)                       | Param                  | `llmapi/visual_gen.py`                                                          |
+
 
 ### 10.11 Naming in Peer Frameworks (Reference)
 
 For context, here's how peer frameworks name their equivalent concepts:
 
-| Concept | Diffusers | SGLang | vLLM-Omni | TRT-LLM LLM API | **TRT-LLM VisualGen (proposed)** |
-|---------|-----------|--------|-----------|-----------------|----------------------------------|
-| Engine class | `StableDiffusionPipeline` | `Server` | `Omni` | `LLM` | `VisualGen` |
-| Engine config | `pipeline.from_pretrained(...)` kwargs | `ServerArgs` | `EngineArgs` | `LlmArgs` | `VisualGenArgs` |
-| Sub-configs | — | Various | — | `KvCacheConfig`, etc. | `ParallelConfig`, etc. |
-| Request params | `__call__(**kwargs)` | `SamplingParams` | `OmniDiffusionSamplingParams` | `SamplingParams` | `VisualGenParams` |
-| Input type | `prompt: str` | `SamplingParams.prompt` | `OmniPromptType` | `PromptInputs` | `str` (plain prompt) |
-| Output (content) | `FluxPipelineOutput` | file / frames | base64 bytes | `CompletionOutput` | `MediaOutput` |
-| Output (request) | — | — | — | `RequestOutput` | `VisualGenOutput` |
-| Async handle | — | — | — | `GenerationResult` | `VisualGenResult` |
-| Internal request | — | `GenerateReqInput` | `OmniDiffusionRequest` | — | `DiffusionRequest` (keep, future rename) |
-| Internal config | — | `PipelineConfig` | — | — | `DiffusionModelConfig` (keep, future rename) |
+
+| Concept          | Diffusers                              | SGLang                  | vLLM-Omni                     | TRT-LLM LLM API       | **TRT-LLM VisualGen (proposed)**             |
+| ---------------- | -------------------------------------- | ----------------------- | ----------------------------- | --------------------- | -------------------------------------------- |
+| Engine class     | `StableDiffusionPipeline`              | `Server`                | `Omni`                        | `LLM`                 | `VisualGen`                                  |
+| Engine config    | `pipeline.from_pretrained(...)` kwargs | `ServerArgs`            | `EngineArgs`                  | `LlmArgs`             | `VisualGenArgs`                              |
+| Sub-configs      | —                                      | Various                 | —                             | `KvCacheConfig`, etc. | `ParallelConfig`, etc.                       |
+| Request params   | `__call__(**kwargs)`                   | `SamplingParams`        | `OmniDiffusionSamplingParams` | `SamplingParams`      | `VisualGenParams`                            |
+| Input type       | `prompt: str`                          | `SamplingParams.prompt` | `OmniPromptType`              | `PromptInputs`        | `Union[str, VisualGenInputs]`                |
+| Output (content) | `FluxPipelineOutput`                   | file / frames           | base64 bytes                  | `CompletionOutput`    | `MediaOutput`                                |
+| Output (request) | —                                      | —                       | —                             | `RequestOutput`       | `VisualGenOutput`                            |
+| Async handle     | —                                      | —                       | —                             | `GenerationResult`    | `VisualGenResult`                            |
+| Internal request | —                                      | `GenerateReqInput`      | `OmniDiffusionRequest`        | —                     | `DiffusionRequest` (keep, future rename)     |
+| Internal config  | —                                      | `PipelineConfig`        | —                             | —                     | `DiffusionModelConfig` (keep, future rename) |
+
 
 ---
 
 ## 11. Proposed API Shape (End-to-End)
 
 ```python
-from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenInputs, VisualGenParams
 from tensorrt_llm.llmapi import ParallelConfig  # after move from _torch/ per §3.1
 
 # ─── Phase 1: Engine Init ───
@@ -1266,10 +1361,10 @@ result = engine.generate("A cat sitting on a windowsill")
 params = VisualGenParams(height=480, width=832, seed=42, num_inference_steps=50)
 result = engine.generate("A cat sitting on a windowsill", params=params)
 
-# Conditioning inputs (i2v) — image on params, not on prompt
+# Conditioning inputs (i2v) — image is part of the input (creative intent)
 result = engine.generate(
-    "Make it snow",
-    params=VisualGenParams(image="summer.jpg", num_frames=81),
+    VisualGenInputs(prompt="Make it snow", image="summer.jpg"),
+    params=VisualGenParams(num_frames=81),
 )
 
 # Batch with shared params
@@ -1334,77 +1429,68 @@ engine.shutdown()
 
 ### By Lifecycle Phase
 
-| Phase | Recommendation | Priority | Breaking Change? |
-|-------|---------------|----------|-----------------|
-| **Init** | Move `VisualGenArgs` + sub-configs from `_torch/` to `llmapi/visual_gen_args.py` (match `llm_args.py` pattern, see §3.1) | High | No (re-export preserves user imports) |
-| **Init** | Rename `diffusion_args` → `args`/`config` | Medium | Yes (param name) |
-| **Request** | `params` defaults to `None` (model defaults); most fields → `Optional[None]` | High | Yes (behavior) |
-| **Request** | Add `extra_params: dict` for model-specific overflow; remove model-specific flat fields | High | Yes (field removal) |
-| **Request** | `extra_params` validated at request time with schema from pipeline | High | No (additive) |
-| **Request** | Support single + batch via Union types (match LLM pattern) | Medium | Yes (signature) |
-| **Request** | Embed `VisualGenParams` in internal wire type (eliminate field-by-field copy) | Medium | No (internal) |
-| **Execute** | Rename future: `DiffusionGenerationResult` → `VisualGenResult` | Low | Yes (type name) |
-| **Execute** | Add optional `on_progress` callback | Medium | No (additive) |
-| **Output** | `generate()` returns `VisualGenOutput` (wraps `MediaOutput`) with `seed_used`, `timing`, `finished` | High | Yes (return type) |
-| **Output** | Add `MediaOutput.save()`, `.to_pil()`, `.to_bytes()` with format/codec/quality args | High | No (additive) |
-| **Output** | `MediaOutput.metadata` carries `frame_rate` from generation | Medium | No (additive) |
-| **Output** | Move `MediaOutput` out of `_torch/` — placement discussed in §9 | Medium | No (re-export preserves imports) |
-| **Output** | Move encoding from `serve/media_storage.py` → `media/encoding.py` | Medium | No (internal) |
-| **Lifecycle** | Define exception hierarchy (`VisualGenError`, `InvalidParamsError`, etc.) | Medium | No (additive) |
-| **Lifecycle** | Expose `warmup(shapes)` method for post-init warm-up | Low | No (additive) |
-| **Structure** | Stay in `llmapi/` for now; prefix internal types with underscore | Low | No (internal) |
-| **Naming** | Establish `*Args`/`*Config`/`*Params`/`*Output` suffix conventions (see §10.2) | High | Convention |
-| **Naming** | Rename public `DiffusionGenerationResult` → `VisualGenResult`; internal `Diffusion*` types keep names (future work, see §4.4, §10.3) | Medium | Yes (`generate_async` users) |
-| **Naming** | Rename `DiffusionGenerationResult` → `VisualGenResult` (public) | Medium | Yes |
-| **Naming** | Drop structured input types (`VisualGenTextPrompt`, `VisualGenTokensPrompt`, `VisualGenPromptInputs`, `VisualGenInputs`); prompt is plain `str` (see §4.1, §10.7) | Medium | Yes |
-| **Naming** | Rename constructor param `diffusion_args` → `args` (see §10.4) | Medium | Yes |
-| **Naming** | Use `VisualGen*` prefix for output/result types: `VisualGenOutput`, `VisualGenResult`, `VisualGenMetrics` (see §10.6) | Medium | Yes |
-| **Init** | Rename `model_path` → `model` for consistency with `LLM(model=...)` (see §3.4) | Medium | Yes (param name) |
-| **Init** | Remove `to_dict()` / `from_dict()` per coding guidelines (see §3.2) | Low | Yes (method removal) |
-| **Request** | Make `VisualGenParams` a Pydantic `StrictBaseModel`, not a dataclass (see §13 Q1) | High | Yes (base class) |
-| **Request** | Remove `output_type` field — redundant with `MediaOutput` convenience methods (see §4.2) | Medium | Yes (field removal) |
-| **Request** | Choose deterministic `seed` default to avoid silent behavior break (see §4.2) | High | Yes (behavior) |
-| **Request** | Specify and document image/conditioning input format on `VisualGenParams` (see §4.1) | High | No (documentation) |
-| **Execute** | Define batch error semantics: raise-on-first vs return-all-with-errors (see §5.1) | High | Yes (contract) |
-| **Execute** | Address thread safety of `req_counter` before stable graduation (see §13 Q10) | Low | No (internal) |
-| **Execute** | Rename `ParamSpec` → `ExtraParamSchema` to avoid `typing.ParamSpec` collision (see §4.3) | Low | Yes (type name) |
-| **Cross-cutting** | Define deprecation/migration strategy for prototype→stable (see §13 Q11) | Medium | Process |
+
+| Phase             | Recommendation                                                                                                                                                                                     | Priority | Breaking Change?                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------- |
+| **Init**          | Move `VisualGenArgs` + sub-configs from `_torch/` to `llmapi/visual_gen_args.py` (match `llm_args.py` pattern, see §3.1)                                                                           | High     | No (re-export preserves user imports) |
+| **Init**          | Rename `diffusion_args` → `args`/`config`                                                                                                                                                          | Medium   | Yes (param name)                      |
+| **Request**       | `params` defaults to `None` (model defaults); most fields → `Optional[None]`                                                                                                                       | High     | Yes (behavior)                        |
+| **Request**       | Add `extra_params: dict` for model-specific overflow; remove model-specific flat fields                                                                                                            | High     | Yes (field removal)                   |
+| **Request**       | `extra_params` validated at request time with schema from pipeline                                                                                                                                 | High     | No (additive)                         |
+| **Request**       | Support single + batch via Union types (match LLM pattern)                                                                                                                                         | Medium   | Yes (signature)                       |
+| **Request**       | Embed `VisualGenParams` in internal wire type (eliminate field-by-field copy)                                                                                                                      | Medium   | No (internal)                         |
+| **Execute**       | Rename future: `DiffusionGenerationResult` → `VisualGenResult`                                                                                                                                     | Low      | Yes (type name)                       |
+| **Execute**       | Add optional `on_progress` callback                                                                                                                                                                | Medium   | No (additive)                         |
+| **Output**        | `generate()` returns `VisualGenOutput` (wraps `MediaOutput`) with `seed_used`, `timing`, `finished`                                                                                                | High     | Yes (return type)                     |
+| **Output**        | Add `MediaOutput.save()`, `.to_pil()`, `.to_bytes()` with format/codec/quality args                                                                                                                | High     | No (additive)                         |
+| **Output**        | `MediaOutput.metadata` carries `frame_rate` from generation                                                                                                                                        | Medium   | No (additive)                         |
+| **Output**        | Move `MediaOutput` out of `_torch/` — placement discussed in §9                                                                                                                                    | Medium   | No (re-export preserves imports)      |
+| **Output**        | Move encoding from `serve/media_storage.py` → `media/encoding.py`                                                                                                                                  | Medium   | No (internal)                         |
+| **Lifecycle**     | Define exception hierarchy (`VisualGenError`, `InvalidParamsError`, etc.)                                                                                                                          | Medium   | No (additive)                         |
+| **Lifecycle**     | Expose `warmup(shapes)` method for post-init warm-up                                                                                                                                               | Low      | No (additive)                         |
+| **Structure**     | Stay in `llmapi/` for now; prefix internal types with underscore                                                                                                                                   | Low      | No (internal)                         |
+| **Naming**        | Establish `*Args`/`*Config`/`*Params`/`*Output` suffix conventions (see §10.2)                                                                                                                     | High     | Convention                            |
+| **Naming**        | Rename public `DiffusionGenerationResult` → `VisualGenResult`; internal `Diffusion*` types keep names (future work, see §4.4, §10.3)                                                               | Medium   | Yes (`generate_async` users)          |
+| **Naming**        | Rename `DiffusionGenerationResult` → `VisualGenResult` (public)                                                                                                                                    | Medium   | Yes                                   |
+| **Naming**        | Drop `VisualGenTextPrompt`, `VisualGenTokensPrompt`, `VisualGenPromptInputs`; repurpose `VisualGenInputs` as structured inputs class for prompt + image + negative_prompt (see §4.1, §10.7) | Medium   | Yes                                   |
+| **Naming**        | Rename constructor param `diffusion_args` → `args` (see §10.4)                                                                                                                                     | Medium   | Yes                                   |
+| **Naming**        | Use `VisualGen*` prefix for output/result types: `VisualGenOutput`, `VisualGenResult`, `VisualGenMetrics` (see §10.6)                                                                              | Medium   | Yes                                   |
+| **Init**          | Rename `model_path` → `model` for consistency with `LLM(model=...)` (see §3.4)                                                                                                                     | Medium   | Yes (param name)                      |
+| **Init**          | Remove `to_dict()` / `from_dict()` per coding guidelines (see §3.2)                                                                                                                                | Low      | Yes (method removal)                  |
+| **Request**       | Make `VisualGenParams` a Pydantic `StrictBaseModel`, not a dataclass (see §13 Q1)                                                                                                                  | High     | Yes (base class)                      |
+| **Request**       | Remove `output_type` field — redundant with `MediaOutput` convenience methods (see §4.2)                                                                                                           | Medium   | Yes (field removal)                   |
+| **Request**       | Choose deterministic `seed` default to avoid silent behavior break (see §4.2)                                                                                                                      | High     | Yes (behavior)                        |
+| **Request**       | Conditioning inputs (image, negative_prompt) live on `VisualGenInputs`, not `VisualGenParams` (see §4.1)                                                                                           | High     | Yes (field move)                      |
+| **Execute**       | Define batch error semantics: raise-on-first vs return-all-with-errors (see §5.1)                                                                                                                  | High     | Yes (contract)                        |
+| **Execute**       | Address thread safety of `req_counter` before stable graduation (see §13 Q10)                                                                                                                      | Low      | No (internal)                         |
+| **Execute**       | Rename `ParamSpec` → `ExtraParamSchema` to avoid `typing.ParamSpec` collision (see §4.3)                                                                                                           | Low      | Yes (type name)                       |
+| **Cross-cutting** | Define deprecation/migration strategy for prototype→stable (see §13 Q11)                                                                                                                           | Medium   | Process                               |
+
 
 ---
 
 ## 13. Open Questions
 
-1. **`VisualGenParams` should be Pydantic, not a dataclass.**
-   `CODING_GUIDELINES.md` states: *"When defining any user-facing configuration classes [...] **always** use Pydantic classes rather than dataclasses or vanilla classes."* `VisualGenParams` is the most-touched user-facing type in the entire API. Making it a dataclass loses `extra="forbid"` (typos silently pass), `model_validator` (cross-field validation like `height % 8 == 0`), and `Field(description=...)`. The QPS overhead concern is valid for LLM `SamplingParams` (thousands of requests/second), but visual generation runs at single-digit requests/second — Pydantic construction overhead (~100μs) is negligible relative to multi-second denoising. The LLM API's `SamplingParams` predates the Pydantic mandate and is a known exception; new user-facing types should not replicate that exception. **Use `StrictBaseModel` with `extra="forbid"` and `Field(description=...)` for all user-facing fields.**
-
+1. `**VisualGenParams` should be Pydantic, not a dataclass.**
+  `CODING_GUIDELINES.md` states: *"When defining any user-facing configuration classes [...] **always** use Pydantic classes rather than dataclasses or vanilla classes."* `VisualGenParams` is the most-touched user-facing type in the entire API. Making it a dataclass loses `extra="forbid"` (typos silently pass), `model_validator` (cross-field validation like `height % 8 == 0`), and `Field(description=...)`. The QPS overhead concern is valid for LLM `SamplingParams` (thousands of requests/second), but visual generation runs at single-digit requests/second — Pydantic construction overhead (~100μs) is negligible relative to multi-second denoising. The LLM API's `SamplingParams` predates the Pydantic mandate and is a known exception; new user-facing types should not replicate that exception. **Use `StrictBaseModel` with `extra="forbid"` and `Field(description=...)` for all user-facing fields.**
 2. **Should `generate()` accept `params=None` for full model defaults?**
-   - `visual_gen.generate("A cat")` is the best possible UX.
-   - Concern: Users might not realize they can tune quality. Mitigation: document model-specific defaults in deployment guides.
-   - **Tentative**: Yes. Match diffusers' `pipeline("A cat")` simplicity.
-
+  - `visual_gen.generate("A cat")` is the best possible UX.
+  - Concern: Users might not realize they can tune quality. Mitigation: document model-specific defaults in deployment guides.
+  - **Tentative**: Yes. Match diffusers' `pipeline("A cat")` simplicity.
 3. **How does `extra_params` map to OpenAI-compatible serving?**
-   - The serving layer converts OpenAI request fields → `VisualGenParams`. Unknown fields → `extra_params`.
-   - Or: the serving layer has its own extension fields that map to specific `extra_params` keys.
-
+  - The serving layer converts OpenAI request fields → `VisualGenParams`. Unknown fields → `extra_params`.
+  - Or: the serving layer has its own extension fields that map to specific `extra_params` keys.
 4. **Should `MediaOutput.save()` support batch tensors directly?**
-   - Currently `save_video` strips batch dim. Should `save()` save only the first item, or require unbatched input?
-   - **Tentative**: `MediaOutput` represents a single generation result (not a batch). Batching is at the `VisualGenOutput` level.
-
+  - Currently `save_video` strips batch dim. Should `save()` save only the first item, or require unbatched input?
+  - **Tentative**: `MediaOutput` represents a single generation result (not a batch). Batching is at the `VisualGenOutput` level.
 5. **Audio muxing in `save()`**: When `output.video` and `output.audio` are both populated (LTX-2), should `save("output.mp4")` automatically mux audio? What codec? (MP4+AAC via ffmpeg)
-
 6. **LoRA support**: SGLang has extensive LoRA support for diffusion. Should `VisualGenParams` (or a separate argument) support LoRA adapters?
-
-8. **Multiple outputs per prompt**: `num_images_per_prompt > 1` — does `VisualGenOutput.output` contain one `MediaOutput` or a list? Proposal: Always one `MediaOutput`, but `image` field shape gains a batch dim. If so, `to_pil()` should return `List[PIL.Image.Image]`, and `save()` needs behavior specification (save first only? save all with index suffix?).
-
-9. **Batch error handling strategy**: When `generate()` processes a batch and some items fail, should it raise on the first error (simpler, current behavior) or return all results with per-item `error` fields (more robust for production)? See §5.1.1. This affects the `VisualGenOutput` contract.
-
-10. **Thread safety of `req_counter`**: `VisualGen.req_counter` is incremented without a lock in `generate_async()`. If multiple threads call `generate_async()` concurrently, request IDs can collide. Options: use `itertools.count()` (atomic under CPython GIL), `threading.Lock`, or `asyncio`-based counter. Low risk for current usage, but should be addressed before stable graduation.
-
-11. **Deprecation / migration strategy from `prototype` → `stable`**: When breaking changes are made (renaming `DiffusionGenerationResult`, changing `diffusion_args` parameter name, etc.), should old names be kept as deprecated aliases for one release cycle? Should there be a migration guide? Since the API is `prototype`, breaking is acceptable, but the transition plan should be documented.
-
-12. **`model_path` → `model` rename**: Should the constructor parameter be renamed from `model_path` to `model` for consistency with `LLM(model=...)` and the diffusers/vLLM ecosystem? See §3.4.
-
-13. **Sub-config re-export story**: Which sub-configs (`ParallelConfig`, `CompilationConfig`, `AttentionConfig`, etc.) should be re-exported from the top-level `tensorrt_llm` namespace vs only available at `tensorrt_llm.llmapi`? The LLM API re-exports key configs (`KvCacheConfig`, etc.) at the top level for convenience.
+7. **Multiple outputs per prompt**: `num_images_per_prompt > 1` — does `VisualGenOutput.output` contain one `MediaOutput` or a list? Proposal: Always one `MediaOutput`, but `image` field shape gains a batch dim. If so, `to_pil()` should return `List[PIL.Image.Image]`, and `save()` needs behavior specification (save first only? save all with index suffix?).
+8. **Batch error handling strategy**: When `generate()` processes a batch and some items fail, should it raise on the first error (simpler, current behavior) or return all results with per-item `error` fields (more robust for production)? See §5.1.1. This affects the `VisualGenOutput` contract.
+9. **Thread safety of `req_counter`**: `VisualGen.req_counter` is incremented without a lock in `generate_async()`. If multiple threads call `generate_async()` concurrently, request IDs can collide. Options: use `itertools.count()` (atomic under CPython GIL), `threading.Lock`, or `asyncio`-based counter. Low risk for current usage, but should be addressed before stable graduation.
+10. **Deprecation / migration strategy from `prototype` → `stable`**: When breaking changes are made (renaming `DiffusionGenerationResult`, changing `diffusion_args` parameter name, etc.), should old names be kept as deprecated aliases for one release cycle? Should there be a migration guide? Since the API is `prototype`, breaking is acceptable, but the transition plan should be documented.
+11. `**model_path` → `model` rename**: Should the constructor parameter be renamed from `model_path` to `model` for consistency with `LLM(model=...)` and the diffusers/vLLM ecosystem? See §3.4.
+12. **Sub-config re-export story**: Which sub-configs (`ParallelConfig`, `CompilationConfig`, `AttentionConfig`, etc.) should be re-exported from the top-level `tensorrt_llm` namespace vs only available at `tensorrt_llm.llmapi`? The LLM API re-exports key configs (`KvCacheConfig`, etc.) at the top level for convenience.
 
 ---
 
@@ -1412,39 +1498,47 @@ engine.shutdown()
 
 ### Diffusers
 
-| File | Content |
-|------|---------|
-| [`utils/outputs.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/utils/outputs.py) | `BaseOutput` class — `OrderedDict`-based output base |
-| [`utils/export_utils.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/utils/export_utils.py) | `export_to_video()`, `export_to_gif()` utilities |
-| [`pipelines/flux/pipeline_output.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_output.py) | `FluxPipelineOutput` — `.images: list[PIL.Image.Image] \| np.ndarray` |
-| [`pipelines/wan/pipeline_output.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/wan/pipeline_output.py) | `WanPipelineOutput` — `.frames: torch.Tensor` |
+
+| File                                                                                                                                      | Content                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| [`utils/outputs.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/utils/outputs.py)                                   | `BaseOutput` class — `OrderedDict`-based output base                 |
+| [`utils/export_utils.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/utils/export_utils.py)                         | `export_to_video()`, `export_to_gif()` utilities                     |
+| [`pipelines/flux/pipeline_output.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_output.py) | `FluxPipelineOutput` — `.images: list[PIL.Image.Image] | np.ndarray` |
+| [`pipelines/wan/pipeline_output.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/wan/pipeline_output.py)   | `WanPipelineOutput` — `.frames: torch.Tensor`                        |
+
 
 ### SGLang Diffusion
 
-| File | Content |
-|------|---------|
-| [`configs/sample/sampling_params.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/sampling_params.py) | `SamplingParams` base (~964 lines). `height: int \| None = None`, `_default_height: ClassVar[int \| None] = None`. Model subclasses override. `__post_init__` applies model defaults. `_validate()` for self-consistency. |
-| [`configs/pipeline_configs/base.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipeline_configs/base.py) | `ModelTaskType` enum (`T2V`, `T2I`, `I2V`, `TI2V`, etc.), pipeline config base |
-| [Issue #20078](https://github.com/sgl-project/sglang/issues/20078) | Bug: diffusers backend ignoring model-specific defaults |
-| [PR #20080](https://github.com/sgl-project/sglang/pull/20080) | Fix: resolve model-specific `sampling_param_cls` via config registry |
+
+| File                                                                                                                                                  | Content                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`configs/sample/sampling_params.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/sampling_params.py) | `SamplingParams` base (~964 lines). `height: int | None = None`, `_default_height: ClassVar[int | None] = None`. Model subclasses override. `__post_init__` applies model defaults. `_validate()` for self-consistency. |
+| [`configs/pipeline_configs/base.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipeline_configs/base.py)   | `ModelTaskType` enum (`T2V`, `T2I`, `I2V`, `TI2V`, etc.), pipeline config base                                                                                                                                          |
+| [Issue #20078](https://github.com/sgl-project/sglang/issues/20078)                                                                                    | Bug: diffusers backend ignoring model-specific defaults                                                                                                                                                                 |
+| [PR #20080](https://github.com/sgl-project/sglang/pull/20080)                                                                                         | Fix: resolve model-specific `sampling_param_cls` via config registry                                                                                                                                                    |
+
 
 ### vLLM-Omni
 
-| File | Content |
-|------|---------|
-| [`inputs/data.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/inputs/data.py) | `OmniDiffusionSamplingParams` (~100+ fields, mixes user params with runtime state: `latents`, `timesteps`, `step_index`, `past_key_values`). `extra_args: dict` for overflow. |
-| [`diffusion/request.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/request.py) | `OmniDiffusionRequest` — wraps `list[OmniPromptType]` + `OmniDiffusionSamplingParams` |
-| [Architecture overview](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/architecture_overview/) | OmniStage, E/P/D/G disaggregation, CFG companion flow |
-| [Image Generation API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/image_generation_api/) | OpenAI DALL-E compatible, base64 PNG output, "pass-through" param handling |
+
+| File                                                                                                         | Content                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`inputs/data.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/inputs/data.py)             | `OmniDiffusionSamplingParams` (~100+ fields, mixes user params with runtime state: `latents`, `timesteps`, `step_index`, `past_key_values`). `extra_args: dict` for overflow. |
+| [`diffusion/request.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/request.py) | `OmniDiffusionRequest` — wraps `list[OmniPromptType]` + `OmniDiffusionSamplingParams`                                                                                         |
+| [Architecture overview](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/architecture_overview/)     | OmniStage, E/P/D/G disaggregation, CFG companion flow                                                                                                                         |
+| [Image Generation API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/image_generation_api/)      | OpenAI DALL-E compatible, base64 PNG output, "pass-through" param handling                                                                                                    |
+
 
 ### Streaming Research
 
-| Reference | Key Insight |
-|-----------|-------------|
-| [StreamWise (arxiv 2603.05800)](https://arxiv.org/abs/2603.05800) | Multi-modal orchestration, adaptive quality, sub-second startup |
-| [HiStream (arxiv 2512.21338)](https://arxiv.org/abs/2512.21338) | Autoregressive video gen, 76-107x faster with spatial/temporal/timestep compression |
-| [WaveSpeed AI](https://wavespeed.ai/landing/real-time-video-generation) | Frame-streaming via WebSocket/WebRTC, sub-500ms latency |
-| [fal.ai streaming](https://docs.fal.ai/documentation/development/streaming) | SSE for diffusion step previews, callback-based progress |
+
+| Reference                                                                   | Key Insight                                                                         |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| [StreamWise (arxiv 2603.05800)](https://arxiv.org/abs/2603.05800)           | Multi-modal orchestration, adaptive quality, sub-second startup                     |
+| [HiStream (arxiv 2512.21338)](https://arxiv.org/abs/2512.21338)             | Autoregressive video gen, 76-107x faster with spatial/temporal/timestep compression |
+| [WaveSpeed AI](https://wavespeed.ai/landing/real-time-video-generation)     | Frame-streaming via WebSocket/WebRTC, sub-500ms latency                             |
+| [fal.ai streaming](https://docs.fal.ai/documentation/development/streaming) | SSE for diffusion step previews, callback-based progress                            |
+
 
 ---
 
