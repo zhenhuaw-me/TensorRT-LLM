@@ -4,6 +4,7 @@
 > **Authors**: Inference Engine Team
 > **Date**: 2026-03-18
 > **Codebase Ref**: [`e71a200`](https://github.com/NVIDIA/TensorRT-LLM/commit/e71a200c4cd83238568ed6bcd2aa0cd7dd539c90)
+> Review doc: https://docs.google.com/document/d/1GlBz3DVfGn4bDZy7fNfmG332mJWzFCUE62RXNV6jT0w/edit?tab=t.0
 
 ---
 
