@@ -20,7 +20,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -437,6 +437,8 @@ class WanImageToVideoPipeline(BasePipeline):
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Validate image input — only single image is supported for batch generation
         if not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
@@ -614,6 +616,7 @@ class WanImageToVideoPipeline(BasePipeline):
             )
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -624,6 +627,7 @@ class WanImageToVideoPipeline(BasePipeline):
             guidance_scale_2=guidance_scale_2,
             boundary_timestep=boundary_timestep,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding video...")
@@ -634,7 +638,8 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(video=video)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(video=video, frame_rate=16.0))
 
     def _encode_prompt(self, prompt: List[str], negative_prompt, max_sequence_length):
         """Encode text prompts to embeddings (same as T2V)."""
