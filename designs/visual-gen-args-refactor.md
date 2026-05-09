@@ -524,6 +524,19 @@ class AdvancedConfig(StrictBaseModel):
     skip_warmup: bool = Field(default=False, status="prototype")
     skip_components: list["PipelineComponent"] = Field(default_factory=list, status="prototype")
 
+class PipelineConfig(StrictBaseModel):
+    """Deprecated. Removed in Phase 7. Only retained to absorb legacy
+    `pipeline.*` keys from existing YAML configs (`fuse_qkv` + the three
+    offload fields) without breaking the soft-removal window. Full
+    declaration with deprecated= fields and the `model_validator(mode="after")`
+    that surfaces the warning lives in §13.1 Phase 3; declared here only
+    so `VisualGenArgs` below can reference the type at class-body time
+    (Codex iter-7 follow-up — Python `NameError` otherwise)."""
+    fuse_qkv: bool = Field(default=True, status="deprecated")
+    enable_offloading: bool = Field(default=False, status="deprecated")
+    offload_device: Literal["cpu", "cuda"] = Field(default="cpu", status="deprecated")
+    offload_param_pin_memory: bool = Field(default=True, status="deprecated")
+
 class WanModelConfig(BaseModelConfig):
     arch: Literal["wan"] = "wan"
     text_encoder: T5Config = Field(default_factory=T5Config, status="prototype")
@@ -612,6 +625,18 @@ class VisualGenArgs(StrictBaseModel):
 > **Suggested direction:** Move `T5Config` above `WanModelConfig` in the §6.4 sketch and prefer `text_encoder: T5Config = Field(default_factory=T5Config)` so the snippet is import-safe and avoids shared default concerns.
 
 > **💬 Claude — addressed:** moved `T5Config` (and `AdvancedConfig`) above `WanModelConfig` in the §6.4 sketch as forward declarations. Switched every Pydantic-model default to `Field(default_factory=...)` to avoid the shared-mutable-default footgun. Added a comment noting the ordering rationale so future edits don't re-break it.
+
+> **🤖 Codex (iter 7) — follow-up:** Canonical sketch references `PipelineConfig` before defining it
+>
+> **Anchor:** §6.4 / Option D — Hybrid (Recommended)
+>
+> §6.4 adds `pipeline: PipelineConfig | None` to `VisualGenArgs`, but the same canonical sketch never declares `PipelineConfig` before `VisualGenArgs`; the only concrete shell appears much later in Phase 3. Implementing the classes in the requested declaration order will raise `NameError: name 'PipelineConfig' is not defined` at class definition time for this annotation, so the promised import-safe sketch and the legacy `pipeline.*` offload compatibility path are not actually copyable.
+>
+> **Suggested direction:** Move or duplicate the Phase 3 four-field deprecated `PipelineConfig` shell into the §6.4 canonical sketch before `VisualGenArgs`, with the declaration order `T5Config`, `AdvancedConfig`, `PipelineConfig`, arch submodels, `ArchConfig`, then `VisualGenArgs`; keep mutable Pydantic defaults on `Field(default_factory=...)`.
+
+> **💬 Claude — addressed:** added a forward-declaration `PipelineConfig` to the §6.4 sketch (with the four `status="deprecated"` fields) right after `AdvancedConfig` and before the arch submodels — the full implementation including the `model_validator(mode="after")` warning path stays in §13.1 Phase 3 (the canonical implementer reference). Declaration order in §6.4 is now: `T5Config` → `AdvancedConfig` → `PipelineConfig` → `WanModelConfig` / `FluxModelConfig` / `LTX2ModelConfig` → `ArchConfig` → `VisualGenArgs`. Sketch is now import-safe.
+
+> **🤖 Codex (iter 7) — implicit resolutions for prior 27 threads:** Iter-7's only follow-up was the `PipelineConfig` declaration order; Codex did not raise follow-ups against any prior thread, which under the iter-7 prompt's strong-convergence-bias framing implicitly resolves them. The Iteration Tracker is updated to reflect this.
 
 **Pros**:
 - **Solves all five categories of pain** in §2.2.
@@ -1678,11 +1703,12 @@ The 10-line version of this doc:
 
 | #  | Date       | Codex focus                                                                | Threads | Resolved | Open | Deferred |
 |----|------------|----------------------------------------------------------------------------|---------|----------|------|----------|
-| 1  | 2026-05-08 | recommendation, field dispositions, migration ordering, stability, discovery, env-var/per-instance | 6       | 0        | 6    | 0        |
-| 2  | 2026-05-08 | iter-1 normative-section drift, phase ordering, resolver/migration ownership, pseudocode bugs, capability-table rot | 5       | 0        | 5    | 0        |
-| 3  | 2026-05-08 | `fuse_qkv` straggler in §6.4 sketch + §12 examples, unimplementable PipelineConfig shell, t5_fsdp_size target field bug, stale §4 principles | 4       | 0        | 4    | 0        |
-| 4  | 2026-05-08 | `_advanced` is private in Pydantic v2, §10.2 stale opening + wrong layer-4 contract, residual `t5_parallel` references, Pydantic `deprecated=` doesn't fire at validation, scope-vs-Tier-2 contradiction | 5       | 0        | 5    | 0        |
-| 5  | 2026-05-08 | offload migration rejects existing `pipeline:` YAML, §1 Exec Summary still defers Tier-2, discriminator both undecided and hardcoded, capability rows frozen at wrong granularity | 4       | 0        | 4    | 0        |
-| 6  | 2026-05-08 | §6.4 sketch omits `advanced` namespace, four-vs-five-file contract leftover in normative sections, T5Config NameError ordering | 3       | 0        | 3    | 0        |
+| 1  | 2026-05-08 | recommendation, field dispositions, migration ordering, stability, discovery, env-var/per-instance | 6       | 6        | 0    | 0        |
+| 2  | 2026-05-08 | iter-1 normative-section drift, phase ordering, resolver/migration ownership, pseudocode bugs, capability-table rot | 5       | 5        | 0    | 0        |
+| 3  | 2026-05-08 | `fuse_qkv` straggler in §6.4 sketch + §12 examples, unimplementable PipelineConfig shell, t5_fsdp_size target field bug, stale §4 principles | 4       | 4        | 0    | 0        |
+| 4  | 2026-05-08 | `_advanced` is private in Pydantic v2, §10.2 stale opening + wrong layer-4 contract, residual `t5_parallel` references, Pydantic `deprecated=` doesn't fire at validation, scope-vs-Tier-2 contradiction | 5       | 5        | 0    | 0        |
+| 5  | 2026-05-08 | offload migration rejects existing `pipeline:` YAML, §1 Exec Summary still defers Tier-2, discriminator both undecided and hardcoded, capability rows frozen at wrong granularity | 4       | 4        | 0    | 0        |
+| 6  | 2026-05-08 | §6.4 sketch omits `advanced` namespace, four-vs-five-file contract leftover in normative sections, T5Config NameError ordering | 3       | 3        | 0    | 0        |
+| 7  | 2026-05-08 | `PipelineConfig` referenced before declaration in §6.4 sketch | 1       | 1        | 0    | 0        |
 
-*Iteration 6 in progress — Codex took a convergence-bias pass and still found three concrete blocking bugs (none stylistic, none duplicates): (a) §6.4 canonical sketch never declared `advanced: AdvancedConfig` despite every later section relying on it; added `AdvancedConfig` class + `advanced` field + the deprecated `pipeline: PipelineConfig | None` shell to the sketch. (b) Normative §10.2 runner-contract paragraph and §1/§4/§14 summaries still said "four-layer" / "four YAMLs" / "all four"; updated to five-file with explicit stable-API vs operational policy split. (c) `WanModelConfig.text_encoder: T5Config = T5Config()` was declared before `class T5Config` (Python NameError); moved T5Config and AdvancedConfig above WanModelConfig and switched every Pydantic-model default to `Field(default_factory=...)`. All 3 iter-6 threads + 24 still-open prior threads awaiting Codex iter-7.*
+*Iteration 7 — Codex took a strong-convergence-bias pass and found exactly **one** concrete blocking bug (not stylistic, not a duplicate): the §6.4 canonical sketch added `pipeline: PipelineConfig | None` to `VisualGenArgs` but never declared `PipelineConfig` in the sketch (only in §13.1 Phase 3 prose), causing a Python `NameError` at class-body time — same class of bug as iter-6 Thread 3 but for a different class. Claude addressed by inserting a forward-declaration `PipelineConfig` shell into the §6.4 sketch right after `AdvancedConfig`, with the full implementation (validator + warning path) staying in §13.1 Phase 3. Declaration order is now: `T5Config` → `AdvancedConfig` → `PipelineConfig` → arch submodels → `ArchConfig` → `VisualGenArgs`. Codex's iter-7 verdict raised no follow-ups on any of the 27 prior threads — under the strong-convergence-bias prompt that's the implicit signal those are all resolved. Tracker updated to reflect 27/27 prior threads + 1/1 iter-7 thread resolved. **Awaiting Codex iter-8 final-check pass to confirm convergence.***
