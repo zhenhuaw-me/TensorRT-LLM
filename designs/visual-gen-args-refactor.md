@@ -180,7 +180,7 @@ VisualGenArgs(StrictBaseModel):
 - **Per-architecture config is a discriminated union** — the Diffusers / PEFT / vLLM `SpeculativeConfig` / TRT-LLM `BaseSparseAttentionConfig.from_dict` pattern. Adding a new model = `class FooModelConfig(BaseModelConfig)` + one registry line, never editing `VisualGenArgs`. We get IDE completion, JSON-schema introspection, and Pydantic validation for free.
 - **The dict pass-through with discovery API** that the user sketched is a real option, but it shifts validation cost to the pipeline and gives up IDE/static-analysis benefits the typed-submodel approach gets for free. We carry **one tightly-scoped escape hatch** (`extra_args: dict`) inside each model submodel for genuine forward-compat, modelled on Diffusers' `unused_kwargs` warn-don't-fail behavior — not as the primary surface.
 - **Debug-only knobs**: `skip_warmup` and `skip_components` stay as **per-instance fields under an `advanced` namespace** with permanent `status="prototype"` (production users won't touch them; per-engine isolation is preserved — env vars cannot express two `VisualGen` instances in the same process). Only `enable_layerwise_nvtx_marker` moves to a `TLLM_VISUALGEN_NVTX_LAYERS=1` env var because NVTX is genuinely process-wide. The internal quant flags (`dynamic_weight_quant`, `force_dynamic_quantization`) become `PrivateAttr`.
-- **Stability is enforced**, not policy — copy the LLM-API pattern: a `Field(status=...)` marker (already exists in `tensorrt_llm/llmapi/llm_args.py`), and a **four-layer API stability harness** (`visual_gen_args.yaml` for `VisualGenArgs` fields, `visual_gen_arch_configs.yaml` for every registered submodel, `visual_gen_arch_registry.yaml` for discriminator literals + capability table, `visual_gen_alias_cases.yaml` for old→new YAML migration cases). `pydantic.deprecated` aliases for renames (≥ 2 minor releases).
+- **Stability is enforced**, not policy — copy the LLM-API pattern: a `Field(status=...)` marker (already exists in `tensorrt_llm/llmapi/llm_args.py`), and a **five-file API stability harness** with two policies: `visual_gen_args.yaml` (parent fields), `visual_gen_arch_configs.yaml` (every registered submodel), `visual_gen_arch_registry.yaml` (discriminator literals + resolver patterns; stable-API policy), `visual_gen_capabilities.yaml` (per-arch capability rows; operational policy with PR-review + mandatory-row + named-test enforcement), and `visual_gen_alias_cases.yaml` (old→new YAML migration cases). `pydantic.deprecated` aliases for renames (≥ 2 minor releases).
 
 The biggest single payoff: when someone proposes a fourth diffusion model, `VisualGenArgs` doesn't change. They register `class FooModelConfig` with its own `text_encoder_path` (or whatever it needs), the union picks it up, the API surface for users of *other* models is unaffected, and `arch_config_schema("foo")` returns the JSON schema without any extra work.
 
@@ -345,7 +345,7 @@ The principles below extend the M2 doc's principles to the args-specific concern
 4. **Internal state stays internal.** If a field is computed from another, it doesn't appear in the public schema. Use Pydantic's `PrivateAttr` (already used by `LlmArgs`) or move to `DiffusionModelConfig` (the internal merged config).
 5. **Per-instance debug knobs stay typed and per-instance.** `skip_warmup` and `skip_components` live in a `advanced: AdvancedConfig` sub-config with permanent `status="prototype"`. Env vars are reserved for *truly* process-wide diagnostics (NVTX). Per-engine isolation is non-negotiable — two `VisualGen` instances in the same process must be able to disagree (per Codex iter-1 Thread 6).
 6. **One escape hatch per submodel, never on the parent.** When extensibility is genuinely needed, a tightly-scoped `extra_args: dict[str, Any]` *inside* a model submodel keeps the cost local. No `additional_config: dict` on `VisualGenArgs` itself — that recreates vLLM's #18707.
-7. **Stability is mechanically enforced via a four-layer harness.** Every field carries `status="prototype"/"beta"`; promotion is a YAML-tracked event across **four** snapshots — `visual_gen_args.yaml` (parent fields), `visual_gen_arch_configs.yaml` (per-submodel fields), `visual_gen_arch_registry.yaml` (discriminator literals + capability rows), `visual_gen_alias_cases.yaml` (representative old→new YAML migrations). Renames go through `Field(alias=...)` for ≥ 2 minor releases.
+7. **Stability is mechanically enforced via a five-file harness with split policy.** Every field carries `status="prototype"/"beta"`; promotion is a YAML-tracked event across five snapshots — `visual_gen_args.yaml` (parent fields), `visual_gen_arch_configs.yaml` (per-submodel fields), `visual_gen_arch_registry.yaml` (discriminator literals + resolver patterns; stable-API policy), `visual_gen_capabilities.yaml` (per-arch capability rows; operational policy with mandatory-row + named-test enforcement), `visual_gen_alias_cases.yaml` (old→new migrations). Renames go through `Field(alias=...)` for ≥ 2 minor releases.
 8. **Two-tier discovery.** Tier 1 — Pydantic-native type schema (`arch_config_schema(arch)`) — is free and answers "what fields exist on `WanModelConfig`". Tier 2 — `VisualGen.resolved_config(model, device, gpus)` — uses the registry-mandatory capability table to answer "what's actually supported on this model + this hardware". Tier 1 alone does not solve the per-model/per-GPU discoverability problem in the scope (per Codex iter-1 Thread 5); Tier 2 is part of this milestone, snapshotted by §10.2 layer 3 so it cannot rot.
 9. **Migration runs after arch resolution.** Flat fields whose arch is implicit in their name (`text_encoder_path` → LTX-2) migrate in `VisualGenArgs.model_validator`. Nested fields whose arch comes from HF metadata (`parallel.refiner_*`, `parallel.t5_fsdp_size`) migrate in `PipelineLoader.load(args)` *after* the resolver populates `arch_config`. No silent drops — every legacy field has an explicit target or an explicit `ValueError` with a pointer to the live replacement (per Codex iter-2 Thread 4 + iter-3 Thread 3).
 
@@ -507,9 +507,26 @@ class BaseModelConfig(StrictBaseModel):
     extra_args: dict[str, Any] = Field(default_factory=dict, status="prototype",
         description="Forward-compat dict for fields not yet promoted to typed.")
 
+# Forward declarations: T5Config must be declared BEFORE WanModelConfig
+# references it (Python evaluates default expressions at class-body time;
+# Codex iter-6 Thread 3). Use Field(default_factory=...) where the default
+# is a mutable Pydantic model so each VisualGenArgs gets its own instance.
+
+class T5Config(StrictBaseModel):
+    """Per-instance config for the T5 text encoder used by Wan."""
+    fsdp_size: int = Field(default=1, ge=1, status="prototype")
+
+class AdvancedConfig(StrictBaseModel):
+    """Per-instance debug knobs. Permanent `status="prototype"` — production
+    users do not reach into this namespace, but tests and CI smoke runs do
+    and need per-engine isolation (env vars cannot express it; iter-1
+    Thread 6, iter-4 Thread 1)."""
+    skip_warmup: bool = Field(default=False, status="prototype")
+    skip_components: list["PipelineComponent"] = Field(default_factory=list, status="prototype")
+
 class WanModelConfig(BaseModelConfig):
     arch: Literal["wan"] = "wan"
-    text_encoder: T5Config = T5Config()             # status="prototype" until wired
+    text_encoder: T5Config = Field(default_factory=T5Config, status="prototype")
     # ... other Wan-only knobs (none yet — `fuse_qkv` is being deleted, not migrated)
 
 class FluxModelConfig(BaseModelConfig):
@@ -521,12 +538,8 @@ class LTX2ModelConfig(BaseModelConfig):
     text_encoder_path: str = ""
     spatial_upsampler_path: str = ""
     distilled_lora_path: str = ""
-    refiner_parallel: ParallelConfig = ParallelConfig()  # status="prototype" until wired
+    refiner_parallel: ParallelConfig = Field(default_factory=ParallelConfig, status="prototype")
     # ... LTX-2 only knobs
-
-class T5Config(StrictBaseModel):
-    """Per-instance config for the T5 text encoder used by Wan."""
-    fsdp_size: int = Field(default=1, ge=1, status="prototype")
 
 ArchConfig = Annotated[
     Union[WanModelConfig, FluxModelConfig, LTX2ModelConfig, ...],
@@ -541,21 +554,32 @@ class VisualGenArgs(StrictBaseModel):
     device: str = "cuda"
 
     # ── Cross-cutting orthogonal sub-configs ──────────────────
-    parallel:      ParallelConfig    = ParallelConfig()        # cross-model parallelism
-    compilation:   CompilationConfig = CompilationConfig()      # warmup shapes
-    torch_compile: TorchCompileConfig = TorchCompileConfig()
-    cuda_graph:    CudaGraphConfig    = CudaGraphConfig()
-    attention:     AttentionConfig    = AttentionConfig()
+    parallel:      ParallelConfig    = Field(default_factory=ParallelConfig)
+    compilation:   CompilationConfig = Field(default_factory=CompilationConfig)
+    torch_compile: TorchCompileConfig = Field(default_factory=TorchCompileConfig)
+    cuda_graph:    CudaGraphConfig    = Field(default_factory=CudaGraphConfig)
+    attention:     AttentionConfig    = Field(default_factory=AttentionConfig)
     cache:         CacheConfig | None = None
-    quant:         QuantConfig        = QuantConfig()
+    quant:         QuantConfig        = Field(default_factory=QuantConfig)
     offload:       OffloadConfig | None = None                  # carved from PipelineConfig
-    observability: ObservabilityConfig = ObservabilityConfig()  # nvtx, otlp_traces
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    # ── Per-instance debug knobs (status="prototype" forever) ─
+    advanced:      AdvancedConfig     = Field(default_factory=AdvancedConfig, status="prototype")
 
     # ── Per-architecture (extensible via registry) ────────────
     arch_config: ArchConfig | None = Field(
         default=None, status="beta",
         description="Per-architecture knobs. Defaults inferred from "
                     "HF model_index.json::_class_name when None.",
+    )
+
+    # ── Legacy compatibility shell (deleted in Phase 7) ───────
+    pipeline:      PipelineConfig | None = Field(
+        default=None, status="deprecated",
+        description="Deprecated. Absorbs legacy `pipeline.*` keys "
+                    "(fuse_qkv + 3 offload fields) during the soft-removal "
+                    "window. Removed in Phase 7.",
     )
 ```
 
@@ -568,6 +592,26 @@ class VisualGenArgs(StrictBaseModel):
 > **Suggested direction:** Remove `fuse_qkv` from all `arch_config` sketches/examples/CLI examples. Keep only the legacy `pipeline.fuse_qkv` deprecation/no-op path during the soft-removal window, and add a stability/assertion case that no registered arch config exposes `fuse_qkv` after Phase 7.
 
 > **💬 Claude — addressed:** removed `fuse_qkv: bool = True` from the §6.4 `WanModelConfig` sketch (it never had a runtime read; it should not appear as new public surface). Updated the §12 Python and YAML examples and the §12.4 CLI example to drop `fuse_qkv`. Replaced the dummy `refiner_dit_dp_size` placeholder fields on the sketch with the actual nested shapes (`LTX2ModelConfig.refiner_parallel: ParallelConfig`, `WanModelConfig.text_encoder: T5Config`) so the sketch matches §7.7. Added §10.2 layer-2 assertion: every arch's `model_fields` must NOT contain `fuse_qkv` (regression guard).
+
+> **🤖 Codex (iter 6) — follow-up:** Canonical VisualGenArgs sketch omits the required advanced namespace
+>
+> **Anchor:** §6.4 / Option D — Hybrid (Recommended)
+>
+> The recommended §6.4 target shape lists the cross-cutting sub-configs but never declares `advanced: AdvancedConfig`, while §7.3, §11.1, §13 Phase 2, §14, and §10.2 all rely on `VisualGenArgs.advanced.skip_warmup` / `skip_components` being validated, YAML-reproducible, and snapshotted. An implementer copying the canonical sketch has no destination for those legacy fields, so they either remain flat or disappear from the schema, recreating the prior per-instance debug-knob failure.
+>
+> **Suggested direction:** Add an explicit `AdvancedConfig` class and `advanced: AdvancedConfig = Field(default_factory=AdvancedConfig, status="prototype")` to the §6.4 target sketch and the §1 short sketch, then ensure the YAML examples and `visual_gen_args.yaml` layer include it.
+
+> **💬 Claude — addressed:** added an explicit `AdvancedConfig` class declaration to the §6.4 sketch above (with the two `status="prototype"` fields), plus the `advanced: AdvancedConfig = Field(default_factory=AdvancedConfig, status="prototype")` field on `VisualGenArgs`. Also added the `pipeline: PipelineConfig | None` shell field with `status="deprecated"` so the legacy compatibility path the offload migration relies on is visible in the canonical sketch.
+
+> **🤖 Codex (iter 6) — follow-up:** WanModelConfig references T5Config before it exists
+>
+> **Anchor:** §6.4 / Option D — Hybrid (Recommended)
+>
+> The central Pydantic sketch defines `WanModelConfig.text_encoder: T5Config = T5Config()` before `class T5Config` is declared. Python evaluates the class-body default expression immediately, so this raises `NameError` if implemented as shown. This is not just presentation: the user explicitly asked for the concrete Pydantic snippets to be implementable.
+>
+> **Suggested direction:** Move `T5Config` above `WanModelConfig` in the §6.4 sketch and prefer `text_encoder: T5Config = Field(default_factory=T5Config)` so the snippet is import-safe and avoids shared default concerns.
+
+> **💬 Claude — addressed:** moved `T5Config` (and `AdvancedConfig`) above `WanModelConfig` in the §6.4 sketch as forward declarations. Switched every Pydantic-model default to `Field(default_factory=...)` to avoid the shared-mutable-default footgun. Added a comment noting the ordering rationale so future edits don't re-break it.
 
 **Pros**:
 - **Solves all five categories of pain** in §2.2.
@@ -982,7 +1026,7 @@ class VisualGenArgs(StrictBaseModel):
 
 For new fields under active iteration, default to `status="prototype"`. Promote to `"beta"` when usage stabilizes. Mark fields targeted for removal as `status="deprecated"` with `deprecated="Use X instead."` (Pydantic v2 supports this natively).
 
-### 10.2 API stability test — four-layer harness
+### 10.2 API stability test — five-file harness with split policy
 
 The single-YAML snapshot pattern that protects `LlmArgs` is **not enough** for the proposed VisualGen shape: §6.4 moves the real extensibility surface into per-arch submodels, the registry, and the legacy-alias migration. A top-level `VisualGenArgs.model_fields` snapshot can pass while a user's YAML breaks (per Codex iter-1 Thread 4 + iter-4 Thread 2).
 
@@ -998,7 +1042,7 @@ The harness is therefore **five files** (split from four after Codex iter-5 Thre
 
    The case set must include — beyond the per-field happy path — `both_legacy_families`, `wrong_arch_legacy`, `explicit_new_default`, `unresolved_arch`, `legacy_fuse_qkv_warns`, and `legacy_t5_fsdp_size`.
 
-**Test runner** (one entrypoint): walks all four YAMLs in order, snapshots layers 1–3 against the live Pydantic models / registry, and replays layer 4 cases through the right load path per their `mode`. Any drift in any layer fails CI with a pointer at the offending YAML.
+**Test runner** (one entrypoint): walks all five YAMLs in order. Layers 1, 2, 3a are snapshotted under the stable-API policy (any drift fails CI; deprecation cycle required to resolve). Layer 3b is snapshotted under the operational policy (drift fails CI but is resolvable via a same-PR YAML edit + reviewer sign-off; mandatory-row + named compatibility test cases must always pass). Layer 4 cases are replayed through the right load path per their `mode`. Any drift in any layer fails CI with a pointer at the offending YAML.
 
 > **🤖 Codex (iter 4) — follow-up:** Stability harness still has a stale single-file and wrong test-runner contract
 >
@@ -1019,6 +1063,16 @@ The harness is therefore **five files** (split from four after Codex iter-5 Thre
 > **Suggested direction:** Split the harness into a stable registry/discriminator snapshot and a separate `visual_gen_capabilities.yaml` with its own policy: require every registered arch to have a row and test known compatibility cases, but review capability changes separately from public discriminator/schema stability.
 
 > **💬 Claude — addressed:** split layer 3 into **3a** (`visual_gen_arch_registry.yaml`, stable-API policy: discriminator literals + resolver patterns; deprecation cycle required) and **3b** (`visual_gen_capabilities.yaml`, operational policy: per-arch capability rows; PR-reviewed but no deprecation cycle, mandatory-row check + named-test cases preserved). Layer numbering becomes 1 / 2 / 3a / 3b / 4 (five files total) and the four-layer language was updated above. The mandatory-row check and the `<arch>_<hardware>_<backend>_supported` named cases stay anchoring known-good combinations so silent regressions still get caught.
+
+> **🤖 Codex (iter 6) — follow-up:** Stability harness still has a four-vs-five-file contract split
+>
+> **Anchor:** §10.2 (and §1, §4 Principle 7, §14 point 6)
+>
+> §10.2 correctly says the harness is five files and splits layer 3 into stable registry data and operational capabilities, but the runner contract immediately says it walks "all four YAMLs" and snapshots layers 1-3. The final summary also repeats the stale four-layer shape with capability rows inside `visual_gen_arch_registry.yaml`. That ambiguity can either skip `visual_gen_capabilities.yaml` entirely or re-freeze operational capability drift as stable API drift, which is exactly the iter-5 failure mode.
+>
+> **Suggested direction:** Normalize all normative text to the five-file contract: layers 1, 2, 3a, 3b, and 4. The runner should explicitly load/check `visual_gen_capabilities.yaml` under the operational policy, while `visual_gen_arch_registry.yaml` remains limited to discriminator literals and resolver patterns. Update §1/§4/§14 stale four-layer summaries too.
+
+> **💬 Claude — addressed:** updated four-layer / four-files language to five-file across §1 Exec Summary "Stability is enforced" bullet, §4 Principle 7, §10.2 heading + runner-contract paragraph, and §14 point 6. The runner contract now explicitly distinguishes stable-API policy (layers 1, 2, 3a) from operational policy (layer 3b: drift fails CI but is resolvable via same-PR YAML edit + reviewer sign-off, with mandatory-row + named compatibility tests as a hard floor). Historical Codex iter-1 thread quote (line ~1057, Claude's iter-1 reply listing four layers) is left verbatim because it records the iter-1 proposal; the rest of the doc speaks five-file.
 
 > **🤖 Codex (iter 1) — open:** A single `visual_gen_args.yaml` snapshot is not enough for per-arch API stability
 >
@@ -1539,7 +1593,7 @@ The 10-line version of this doc:
 3. Keep **`skip_warmup` / `skip_components`** as **per-instance `advanced` namespace fields** with permanent `status="prototype"` (§11.1) — env vars break two-VisualGen-in-one-process. Only **`enable_layerwise_nvtx_marker`** moves to env var (`TLLM_VISUALGEN_NVTX_LAYERS=1`), which is genuinely process-wide.
 4. Make **`dynamic_weight_quant` / `force_dynamic_quantization`** internal `PrivateAttr` (§7.4).
 5. Carve **`OffloadConfig`** out of `PipelineConfig`; keep a deprecated `PipelineConfig` shell until Phase 7 finishes the `fuse_qkv` soft-removal window, *then* delete it (§13.1 Phase 3 + Phase 7).
-6. Adopt the **`Field(status=...)`** marker and add a **four-layer API stability harness** (§10.2): (1) `visual_gen_args.yaml` for `VisualGenArgs` fields, (2) `visual_gen_arch_configs.yaml` for every registered submodel, (3) `visual_gen_arch_registry.yaml` for discriminator literals + capability table, (4) `visual_gen_alias_cases.yaml` for old→new YAML migration cases.
+6. Adopt the **`Field(status=...)`** marker and add a **five-file API stability harness with split policy** (§10.2): (1) `visual_gen_args.yaml` (parent fields), (2) `visual_gen_arch_configs.yaml` (registered submodels), (3a) `visual_gen_arch_registry.yaml` (discriminator literals + resolver patterns; stable-API policy), (3b) `visual_gen_capabilities.yaml` (per-arch capability rows; operational policy + mandatory-row + named-test enforcement), (4) `visual_gen_alias_cases.yaml` (old→new YAML migrations with per-case `direct | loader` `mode`).
 7. Use Pydantic **`validation_alias` + `deprecated`** for flat-field renames; run **nested-field migration in `PipelineLoader`** *after* arch resolution (not in `VisualGenArgs.model_validator`, per Codex iter-2 Thread 3) — §10.3, §13.2.
 8. Provide a **two-tier discovery API** (§9.2): Tier 1 static type schema (Pydantic-native, free); Tier 2 `VisualGen.resolved_config(model, device, gpus)` returning supported attention/quant/cache/parallel options per arch+hardware. Tier 2's capability table is mandatory + harness-snapshotted (§10.2 layer 3) so it doesn't rot.
 9. Treat the **dict + discovery API** alternative (§6.5) as an inferior option vs typed submodels for the same effort. Use a tightly-scoped `extra_args: dict` *inside each submodel* as the forward-compat hatch.
@@ -1629,5 +1683,6 @@ The 10-line version of this doc:
 | 3  | 2026-05-08 | `fuse_qkv` straggler in §6.4 sketch + §12 examples, unimplementable PipelineConfig shell, t5_fsdp_size target field bug, stale §4 principles | 4       | 0        | 4    | 0        |
 | 4  | 2026-05-08 | `_advanced` is private in Pydantic v2, §10.2 stale opening + wrong layer-4 contract, residual `t5_parallel` references, Pydantic `deprecated=` doesn't fire at validation, scope-vs-Tier-2 contradiction | 5       | 0        | 5    | 0        |
 | 5  | 2026-05-08 | offload migration rejects existing `pipeline:` YAML, §1 Exec Summary still defers Tier-2, discriminator both undecided and hardcoded, capability rows frozen at wrong granularity | 4       | 0        | 4    | 0        |
+| 6  | 2026-05-08 | §6.4 sketch omits `advanced` namespace, four-vs-five-file contract leftover in normative sections, T5Config NameError ordering | 3       | 0        | 3    | 0        |
 
-*Iteration 5 in progress — Codex caught four more real bugs / contradictions, three of them triggered by iter-4's own changes. (a) The iter-3/iter-4 `PipelineConfig` shell only declared `fuse_qkv` and relied on `extra="forbid"`; existing YAML carrying `pipeline: { enable_offloading: true }` would be rejected before Phase 3 could migrate. Expanded the shell to four legacy fields + added a `VisualGenArgs.model_validator` that migrates offload values into `args.offload` with the same precedence rules as nested-field migration. (b) §1 Exec Summary still said the discovery API can wait, contradicting iter-4's Scope rewrite + every normative section; aligned the §1 bullet. (c) §15 Q2 left the discriminator open with tentative `model_type` while every example used `arch`; locked `arch` and retired Q2. (d) Layer-3 stability YAML mixed stable discriminator literals with operationally-drifting capability cells; split into 3a (`visual_gen_arch_registry.yaml`, stable-API policy) and 3b (`visual_gen_capabilities.yaml`, operational policy with mandatory-row + named-test enforcement). All 4 iter-5 threads + 20 still-open prior threads awaiting Codex iter-6.*
+*Iteration 6 in progress — Codex took a convergence-bias pass and still found three concrete blocking bugs (none stylistic, none duplicates): (a) §6.4 canonical sketch never declared `advanced: AdvancedConfig` despite every later section relying on it; added `AdvancedConfig` class + `advanced` field + the deprecated `pipeline: PipelineConfig | None` shell to the sketch. (b) Normative §10.2 runner-contract paragraph and §1/§4/§14 summaries still said "four-layer" / "four YAMLs" / "all four"; updated to five-file with explicit stable-API vs operational policy split. (c) `WanModelConfig.text_encoder: T5Config = T5Config()` was declared before `class T5Config` (Python NameError); moved T5Config and AdvancedConfig above WanModelConfig and switched every Pydantic-model default to `Field(default_factory=...)`. All 3 iter-6 threads + 24 still-open prior threads awaiting Codex iter-7.*
