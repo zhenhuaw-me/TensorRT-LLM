@@ -66,10 +66,11 @@ without leaning on any single style choice prematurely.
 - **Implementation PRs / detailed impl plan** beyond the migration
   outline (the doc lists 10 phases, but this doc does not commit
   individual PR breakdowns, owners, or dates).
-- **Final discriminator-name choice** for the per-architecture union
-  (left as an Open Question; tentative answer captured but not locked).
 - **Public registry contract for out-of-tree plugins** — left as an
-  Open Question; not in this milestone.
+  Open Question; not in this milestone. (The internal arch
+  discriminator is **locked**: `arch: Literal["wan", "flux", "ltx2", ...]`
+  — see §1 below. Only the public `register_arch_config(...)` plugin
+  surface is deferred.)
 - **Discovery-API CLI/UX polish** (e.g. pretty-printers, IDE
   integrations) beyond the typed schema and the `resolved_config()`
   return value — not required for this design to land. The minimal
@@ -537,6 +538,19 @@ class PipelineConfig(StrictBaseModel):
     offload_device: Literal["cpu", "cuda"] = Field(default="cpu", status="deprecated")
     offload_param_pin_memory: bool = Field(default=True, status="deprecated")
 
+class OffloadConfig(StrictBaseModel):
+    """New cross-cutting offloading sub-config (§7.6 / §13.1 Phase 3).
+    Field names are the migration targets for `pipeline.enable_offloading`,
+    `pipeline.offload_device`, and `pipeline.offload_param_pin_memory`."""
+    enabled:    bool                  = Field(default=False)
+    device:     Literal["cpu", "cuda"] = Field(default="cpu")
+    pin_memory: bool                  = Field(default=True)
+
+class ObservabilityConfig(StrictBaseModel):
+    """Cross-cutting observability sub-config — logs, traces, metrics.
+    Minimal placeholder for this milestone; expands in a follow-up."""
+    otlp_traces_endpoint: str | None = Field(default=None, status="prototype")
+
 class WanModelConfig(BaseModelConfig):
     arch: Literal["wan"] = "wan"
     text_encoder: T5Config = Field(default_factory=T5Config, status="prototype")
@@ -637,6 +651,26 @@ class VisualGenArgs(StrictBaseModel):
 > **💬 Claude — addressed:** added a forward-declaration `PipelineConfig` to the §6.4 sketch (with the four `status="deprecated"` fields) right after `AdvancedConfig` and before the arch submodels — the full implementation including the `model_validator(mode="after")` warning path stays in §13.1 Phase 3 (the canonical implementer reference). Declaration order in §6.4 is now: `T5Config` → `AdvancedConfig` → `PipelineConfig` → `WanModelConfig` / `FluxModelConfig` / `LTX2ModelConfig` → `ArchConfig` → `VisualGenArgs`. Sketch is now import-safe.
 
 > **🤖 Codex (iter 7) — implicit resolutions for prior 27 threads:** Iter-7's only follow-up was the `PipelineConfig` declaration order; Codex did not raise follow-ups against any prior thread, which under the iter-7 prompt's strong-convergence-bias framing implicitly resolves them. The Iteration Tracker is updated to reflect this.
+
+> **🤖 Codex (iter 8) — follow-up:** Canonical sketch still references undeclared new config classes
+>
+> **Anchor:** §6.4 / Option D — Hybrid (Recommended)
+>
+> §6.4 now declares PipelineConfig before VisualGenArgs, but the same canonical sketch still references OffloadConfig and ObservabilityConfig without declaring them anywhere in the doc. This is not just an existing-import omission: OffloadConfig is introduced by this design as a new carve-out, and the Wan + offloading path in §13 calls OffloadConfig() during migration. An implementer copying the target shape still hits NameError/unresolved Pydantic annotations before the offload scenario can work; ObservabilityConfig also has an evaluated default_factory reference.
+>
+> **Suggested direction:** Add concrete OffloadConfig and ObservabilityConfig declarations before VisualGenArgs in §6.4, or remove ObservabilityConfig from the target surface until its shape is specified. Also include OffloadConfig in the declaration-order note and mirror the fields used by the §13 migration: enabled, device, and pin_memory.
+
+> **💬 Claude — addressed:** added concrete `OffloadConfig` (`enabled`, `device`, `pin_memory` — matching the migration targets in §13.2.1's `_migrate_legacy_pipeline_offload`) and minimal `ObservabilityConfig` (`otlp_traces_endpoint`) declarations to the §6.4 sketch right after `PipelineConfig`. Final declaration order: `T5Config` → `AdvancedConfig` → `PipelineConfig` → `OffloadConfig` → `ObservabilityConfig` → arch submodels → `ArchConfig` → `VisualGenArgs`.
+
+> **🤖 Codex (iter 8) — follow-up:** Scope still says the discriminator is undecided after the design locks `arch`
+>
+> **Anchor:** Scope, Target & Non-Goals / Out of scope (non-goals)
+>
+> The non-goals still state that the final discriminator-name choice is out of scope and only tentative, while §1, §6.4, §10.2, §14, and §15 all treat arch as the resolved discriminator and snapshot it in the stability harness. That is an implementer-visible contradiction: following the scope permits deferring or changing the discriminator while later normative sections require a stable arch literal contract.
+>
+> **Suggested direction:** Replace this non-goal with the resolved decision: arch is locked for this milestone; only out-of-tree registry/plugin naming remains open.
+
+> **💬 Claude — addressed:** removed the "Final discriminator-name choice" non-goal and folded its remainder into the existing "Public registry contract for out-of-tree plugins" non-goal — that bullet now explicitly states the internal `arch` literal is **locked** and only the public `register_arch_config(...)` plugin surface is deferred.
 
 **Pros**:
 - **Solves all five categories of pain** in §2.2.
@@ -1710,5 +1744,6 @@ The 10-line version of this doc:
 | 5  | 2026-05-08 | offload migration rejects existing `pipeline:` YAML, §1 Exec Summary still defers Tier-2, discriminator both undecided and hardcoded, capability rows frozen at wrong granularity | 4       | 4        | 0    | 0        |
 | 6  | 2026-05-08 | §6.4 sketch omits `advanced` namespace, four-vs-five-file contract leftover in normative sections, T5Config NameError ordering | 3       | 3        | 0    | 0        |
 | 7  | 2026-05-08 | `PipelineConfig` referenced before declaration in §6.4 sketch | 1       | 1        | 0    | 0        |
+| 8  | 2026-05-08 | §6.4 sketch still references `OffloadConfig` / `ObservabilityConfig` without declaring them; Scope still says discriminator is undecided | 2       | 2        | 0    | 0        |
 
-*Iteration 7 — Codex took a strong-convergence-bias pass and found exactly **one** concrete blocking bug (not stylistic, not a duplicate): the §6.4 canonical sketch added `pipeline: PipelineConfig | None` to `VisualGenArgs` but never declared `PipelineConfig` in the sketch (only in §13.1 Phase 3 prose), causing a Python `NameError` at class-body time — same class of bug as iter-6 Thread 3 but for a different class. Claude addressed by inserting a forward-declaration `PipelineConfig` shell into the §6.4 sketch right after `AdvancedConfig`, with the full implementation (validator + warning path) staying in §13.1 Phase 3. Declaration order is now: `T5Config` → `AdvancedConfig` → `PipelineConfig` → arch submodels → `ArchConfig` → `VisualGenArgs`. Codex's iter-7 verdict raised no follow-ups on any of the 27 prior threads — under the strong-convergence-bias prompt that's the implicit signal those are all resolved. Tracker updated to reflect 27/27 prior threads + 1/1 iter-7 thread resolved. **Awaiting Codex iter-8 final-check pass to confirm convergence.***
+*Iteration 8 (final-check) — Codex applied the strict "concrete blocker only" filter and found two [medium] follow-ups, both of the same flavor as the iter-6/iter-7 declaration-order class: (a) `OffloadConfig` and `ObservabilityConfig` were referenced in the §6.4 `VisualGenArgs` sketch but never declared anywhere in the doc; added concrete forward declarations (matching the migration targets `enabled`/`device`/`pin_memory` for `OffloadConfig`, minimal `otlp_traces_endpoint` for `ObservabilityConfig`). (b) Scope/Non-Goals still contained "Final discriminator-name choice ... left as an Open Question" while §1 and §15 already locked `arch`; removed the non-goal and folded its remainder into the existing "Public registry contract for out-of-tree plugins" non-goal. Final declaration order in the §6.4 sketch is: `T5Config` → `AdvancedConfig` → `PipelineConfig` → `OffloadConfig` → `ObservabilityConfig` → arch submodels → `ArchConfig` → `VisualGenArgs`. Both iter-8 threads marked resolved. **Awaiting Codex iter-9 final-check pass to confirm convergence.***
