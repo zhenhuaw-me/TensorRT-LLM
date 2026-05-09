@@ -186,9 +186,30 @@ The biggest single payoff: when someone proposes a fourth diffusion model, `Visu
 
 ### What this doc does *not* commit to
 
-- It does **not** prescribe whether the discriminator is `arch` (HF architectures field), `model_type`, or `pipeline_class_name`. That choice is sketched in §7 and §15 and intentionally kept as an open question for the implementation.
 - It does **not** require migrating internal `DiffusionModelConfig` (the merged/parsed config built by `PipelineLoader`) — that stays internal and tracks the deferred `Diffusion*` → `VisualGen*` rename in M2 §10.3.
-- It does **not** require the discovery API to ship in this milestone. JSON-schema introspection is "free" once the typed submodels exist; a polished `engine.config_schema()` method can wait.
+- It does **not** require **CLI/UX polish** on top of the discovery API (pretty-printers, IDE integrations, `--describe` subcommands). The minimal Tier-1 typed schema (`arch_config_schema(arch)`) and Tier-2 capability schema (`VisualGen.resolved_config(model, device, gpus)`) **are** in scope, with the registry-mandatory capability snapshot in §10.2 layer 3 (per Codex iter-1 Thread 5 + iter-4 Thread 5 + iter-5 Thread 2). Only the surface polish on top is deferred.
+
+**Discriminator chosen**: `arch: Literal["wan", "flux", "ltx2", ...]`. Picked over `model_type` and `class_name` for brevity and decoupling from HF metadata field names. Locked in iter 5 (Codex Thread 3); §15 Q2 retired. All sketches, examples, alias cases, and the layer-3 stability snapshot use `arch`.
+
+> **🤖 Codex (iter 5) — follow-up:** Executive summary still defers required Tier-2 discovery
+>
+> **Anchor:** §1 / What this doc does *not* commit to
+>
+> The executive summary still says the discovery API is not required in this milestone. That directly conflicts with the updated scope, §4, §9.2, §13 Phase 8, and §14, all of which now require `VisualGen.resolved_config(...)` plus a registry capability table and stability snapshot. An implementer assigned only the summary can ship the typed submodels without the capability layer, reintroducing the exact per-model/per-GPU discoverability gap iter 4 was supposed to close.
+>
+> **Suggested direction:** Rewrite this bullet to defer only CLI/UX polish while making Tier-1 schema, Tier-2 `resolved_config()`, and the capability-table snapshot mandatory; otherwise remove Phase 8 and all Tier-2 requirements from the milestone.
+
+> **💬 Claude — addressed:** rewrote the §1 "not commit to" bullet (above) to say only **CLI/UX polish** is deferred — Tier-1 + Tier-2 + the capability snapshot are in scope. Now consistent with Scope (§Non-Goals), §4 Principle 8, §9.2 Tier 2, §10.2 layer 3, §13.1 Phase 8, and §14 point 8.
+
+> **🤖 Codex (iter 5) — follow-up:** Public discriminator is both undecided and hardcoded
+>
+> **Anchor:** §1 / Discriminator (and §15 Q2)
+>
+> §15 keeps the discriminator value open and even says `model_type` is the tentative user-facing choice, while the normative sketches, YAML examples, and stability harness hardcode `arch`/`Field(discriminator="arch")`. This is not cosmetic: the chosen discriminator is part of every YAML payload and the API-stability snapshots. If implementation follows §6/§10 it freezes `arch`; if it follows §15 it invalidates the examples and alias cases.
+>
+> **Suggested direction:** Choose the discriminator before finalize and update §1, §6.4, §10.2, §12, §13, and §14 to one concrete public YAML shape. If the choice remains open, mark implementation of the union, examples, and stability harness as blocked.
+
+> **💬 Claude — addressed:** locked in `arch: Literal["wan", "flux", "ltx2", ...]` (the §1 paragraph above states the choice). §15 Q2 retired with a strikethrough + pointer to this decision. §6.4 sketch / §12 examples / §10.2 layer 3a / §13.1 Phase 4 / §14 already use `arch`; no further normative edits needed.
 
 ---
 
@@ -965,11 +986,12 @@ For new fields under active iteration, default to `status="prototype"`. Promote 
 
 The single-YAML snapshot pattern that protects `LlmArgs` is **not enough** for the proposed VisualGen shape: §6.4 moves the real extensibility surface into per-arch submodels, the registry, and the legacy-alias migration. A top-level `VisualGenArgs.model_fields` snapshot can pass while a user's YAML breaks (per Codex iter-1 Thread 4 + iter-4 Thread 2).
 
-The harness is therefore **four files**, all under `tests/unittest/api_stability/references/`, all driven by one runner entrypoint (an extension of the existing `api_stability_core.py`):
+The harness is therefore **five files** (split from four after Codex iter-5 Thread 4 — capability cells need a different change-policy than discriminator literals), all under `tests/unittest/api_stability/references/`, all driven by one runner entrypoint (an extension of the existing `api_stability_core.py`):
 
 1. **`visual_gen_args.yaml`** — snapshot of `VisualGenArgs.model_fields` (cross-cutting fields, plus the `arch_config` field, plus the `advanced` namespace). Same pattern as `llm.yaml`.
 2. **`visual_gen_arch_configs.yaml`** — one section per registered arch submodel (`WanModelConfig`, `FluxModelConfig`, `LTX2ModelConfig`, …). Snapshots fields, types, defaults, and `status`. **Layer-2 regression assertion**: no submodel may expose `fuse_qkv` (per Codex iter-3 Thread 1). Adding/removing/renaming a submodel field, or adding/removing a registered arch, forces a YAML edit.
-3. **`visual_gen_arch_registry.yaml`** — frozen list of `arch:` discriminator literals (`"wan"`, `"flux"`, `"ltx2"`, …), the HF `_class_name` patterns the resolver matches on, **and** the per-arch capability rows (supported attention backends, supported quant algos, supported cache backends, parallel constraints). Discriminator drift, capability-cell drift, and capability-row absence (a registered arch with no row) all force a YAML edit.
+3a. **`visual_gen_arch_registry.yaml`** — frozen list of `arch:` discriminator literals (`"wan"`, `"flux"`, `"ltx2"`, …) and the HF `_class_name` patterns the resolver matches on. **Stable-API policy**: any drift in discriminator literals or resolver patterns is a public-API break; needs a deprecation cycle and reviewer sign-off.
+3b. **`visual_gen_capabilities.yaml`** — per-arch capability rows (supported attention backends, supported quant algos, supported cache backends, parallel constraints) — split from layer 3a per Codex iter-5 Thread 4. **Operational policy**: capability cells are *expected* to drift as kernels, hardware, and backend integrations mature; this YAML tracks the live state but the change policy is "PR-reviewed, no deprecation cycle". The mandatory-row check from §9.2 still lives here (every registered arch must have a row), and named compatibility test cases (e.g. `wan_h100_fa4_nvfp4_supported = True`) anchor known-good combinations so silent regressions get caught.
 4. **`visual_gen_alias_cases.yaml`** — table of representative old→new YAML inputs paired with their expected resolved `arch_config` shape. Each case has a `mode`:
    - `direct` — load via `VisualGenArgs(**input)` (covers flat aliases that migrate in `model_validator`, e.g. `text_encoder_path`).
    - `loader` — load via `PipelineLoader.load(args)` with a fixture `model_index.json` (covers nested aliases that migrate post-arch-resolution, e.g. `parallel.refiner_*`, `parallel.t5_fsdp_size`, `pipeline.fuse_qkv`).
@@ -987,6 +1009,16 @@ The harness is therefore **four files**, all under `tests/unittest/api_stability
 > **Suggested direction:** Rewrite §10.2 as a single normative block: four reference files under one directory, one runner entrypoint that loads all four layers, and layer-4 cases split between direct `VisualGenArgs` construction for flat aliases and loader-backed fixture `model_index.json` cases for nested migration.
 
 > **💬 Claude — addressed:** rewrote §10.2 opening above as a single normative block: four reference files, one runner entrypoint, and per-case `mode` field that splits layer-4 cases between `direct` (flat aliases) and `loader` (nested aliases with fixture `model_index.json`). Listed the required case names explicitly so future PRs can grep for "any case I added must appear in `visual_gen_alias_cases.yaml`".
+
+> **🤖 Codex (iter 5) — follow-up:** Capability rows are frozen at the wrong stability granularity
+>
+> **Anchor:** §10.2 / Layer 3
+>
+> Layer 3 snapshots discriminator literals, resolver patterns, and every capability row in one `visual_gen_arch_registry.yaml`, so capability-cell drift is treated like public discriminator drift. Capability support is expected to change as kernels, hardware, and backend integrations mature; tying it to the same API snapshot either over-freezes operational support claims or creates noisy churn that can hide real public-schema breaks.
+>
+> **Suggested direction:** Split the harness into a stable registry/discriminator snapshot and a separate `visual_gen_capabilities.yaml` with its own policy: require every registered arch to have a row and test known compatibility cases, but review capability changes separately from public discriminator/schema stability.
+
+> **💬 Claude — addressed:** split layer 3 into **3a** (`visual_gen_arch_registry.yaml`, stable-API policy: discriminator literals + resolver patterns; deprecation cycle required) and **3b** (`visual_gen_capabilities.yaml`, operational policy: per-arch capability rows; PR-reviewed but no deprecation cycle, mandatory-row check + named-test cases preserved). Layer numbering becomes 1 / 2 / 3a / 3b / 4 (five files total) and the four-layer language was updated above. The mandatory-row check and the `<arch>_<hardware>_<backend>_supported` named cases stay anchoring known-good combinations so silent regressions still get caught.
 
 > **🤖 Codex (iter 1) — open:** A single `visual_gen_args.yaml` snapshot is not enough for per-arch API stability
 >
@@ -1160,40 +1192,81 @@ The refactor breaks into independent phases. Each is mergeable on its own, and e
 
 **Phase 2 — Internal-state cleanup.** Move `dynamic_weight_quant`, `force_dynamic_quantization` to `PrivateAttr`. Move `enable_layerwise_nvtx_marker` to env var (truly process-wide diagnostics); keep `skip_warmup` / `skip_components` as `advanced` namespace `status="prototype"` fields, **not** env vars (per Codex Thread 6 — env vars break per-engine isolation).
 
-**Phase 3 — `OffloadConfig` carve-out.** Promote the 3 offloading fields out of `PipelineConfig` into a new `OffloadConfig`. **Keep `PipelineConfig` as a deprecated single-field shell** until Phase 7 closes the `fuse_qkv` soft-removal window:
+**Phase 3 — `OffloadConfig` carve-out.** Promote the 3 offloading fields out of `PipelineConfig` into a new `OffloadConfig`. **Keep `PipelineConfig` as a deprecated four-field shell** until Phase 7 closes the `fuse_qkv` soft-removal window — the shell must absorb every legacy `pipeline.*` key (not just `fuse_qkv`), or `extra="forbid"` would reject existing YAML carrying `pipeline: { enable_offloading: true }` before migration can run (Codex iter-5 Thread 1):
 
 ```python
 class PipelineConfig(StrictBaseModel):
     """Deprecated. Removed in Phase 7. Only retained to absorb legacy
-    `pipeline.fuse_qkv` from existing YAML configs without breaking the
-    soft-removal window."""
+    `pipeline.*` keys (fuse_qkv + the three offload fields) from existing
+    YAML configs without breaking the soft-removal window."""
 
     fuse_qkv: bool = Field(
         default=True,
         status="deprecated",
         deprecated="`pipeline.fuse_qkv` has no runtime effect since "
-                   "e527a9f785; QKV fusion is selected via QKVMode "
-                   "in attention.py. The field will be removed in "
-                   "Phase 7. Stop setting it.",
+                   "e527a9f785. Field removed in Phase 7.",
+    )
+    enable_offloading: bool = Field(
+        default=False,
+        status="deprecated",
+        deprecated="Use `offload.enabled` (offload: { enabled: true }).",
+    )
+    offload_device: Literal["cpu", "cuda"] = Field(
+        default="cpu",
+        status="deprecated",
+        deprecated="Use `offload.device`.",
+    )
+    offload_param_pin_memory: bool = Field(
+        default=True,
+        status="deprecated",
+        deprecated="Use `offload.pin_memory`.",
     )
 
     @model_validator(mode="after")
     def _warn_if_set(self) -> "PipelineConfig":
         # Pydantic's Field(deprecated=...) only sets schema metadata and
-        # warns on attribute *access*, not at validation time (per Codex
-        # iter-4 Thread 4). For YAML payloads that set `pipeline.fuse_qkv`
-        # but never read it back, a validator-driven warning is required to
-        # actually surface the deprecation.
-        if "fuse_qkv" in self.model_fields_set:
+        # warns on attribute *access*, not at validation time (Codex
+        # iter-4 Thread 4). The validator surfaces the deprecation
+        # explicitly so YAML payloads that set the field but never read
+        # it actually trigger the warning.
+        for legacy in self.model_fields_set:
             warnings.warn(
-                "`pipeline.fuse_qkv` is deprecated and has no runtime "
-                "effect; the field will be removed in Phase 7.",
+                f"`pipeline.{legacy}` is deprecated. "
+                f"{type(self).model_fields[legacy].deprecated}",
                 DeprecationWarning, stacklevel=2,
             )
         return self
 ```
 
-This is an implementable shape (`StrictBaseModel` + a single `deprecated` field is fine; `extra="forbid"` blocks unknowns but the one declared field carries the legacy payload). The explicit `model_validator` is what actually fires the deprecation warning when the user supplies the field — Pydantic's `Field(deprecated=...)` alone only fires on attribute *access*, which doesn't happen for a no-op field. The value is otherwise discarded. Phase 7 deletes both the field, the validator, and the class.
+`VisualGenArgs.model_validator(mode="after")` then migrates the three
+offload fields into `args.offload`, with the same precedence rules as
+the nested-field migration (§13.2.1):
+
+```python
+@model_validator(mode="after")
+def _migrate_legacy_pipeline_offload(self) -> "VisualGenArgs":
+    if self.pipeline is None:
+        return self
+    legacy_offload = {
+        "enabled":    "enable_offloading",
+        "device":     "offload_device",
+        "pin_memory": "offload_param_pin_memory",
+    }
+    for new_field, legacy_field in legacy_offload.items():
+        if legacy_field not in self.pipeline.model_fields_set:
+            continue
+        if self.offload is None:
+            self.offload = OffloadConfig()
+        if new_field in self.offload.model_fields_set:
+            raise ValueError(
+                f"Both legacy `pipeline.{legacy_field}` and explicit "
+                f"`offload.{new_field}` are set. Pick one."
+            )
+        setattr(self.offload, new_field, getattr(self.pipeline, legacy_field))
+    return self
+```
+
+This makes the offload soft-removal window actually work: legacy YAML parses, the validator fires deprecation warnings + migrates values, explicit-vs-legacy conflicts raise `ValueError`. Phase 7 deletes the four-field shell, both validators, and the class. Layer-4 alias cases gain `legacy_pipeline_offload`, `mixed_pipeline_offload_and_offload_explicit`, and `legacy_fuse_qkv_with_offload`.
 
 > **🤖 Codex (iter 2) — open:** Phase order deletes `PipelineConfig` before `fuse_qkv` compatibility can run
 >
@@ -1214,6 +1287,16 @@ This is an implementable shape (`StrictBaseModel` + a single `deprecated` field 
 > **Suggested direction:** Specify an explicit compatibility mechanism: either keep a deprecated no-op `PipelineConfig.fuse_qkv` field until Phase 7, or consume `pipeline.fuse_qkv` in a `mode="before"` validator/hidden legacy field using an `AliasPath`, with an alias-case test that proves the warning path works.
 
 > **💬 Claude — addressed:** replaced the unimplementable "empty shell with validation_alias" with a concrete single-field deprecated `PipelineConfig.fuse_qkv: bool = Field(deprecated=...)` (Codex's first option above). Pydantic's native `deprecated=` emits the warning; `StrictBaseModel`'s `extra="forbid"` still rejects any other unknown nested keys. Phase 7 deletes both the field and the class. §10.2 layer 4 (`visual_gen_alias_cases.yaml`) gains a case `legacy_fuse_qkv_warns` that loads `{"pipeline": {"fuse_qkv": True}}`, asserts the deprecation warning fires, and asserts no field on the resolved `arch_config` exposes `fuse_qkv`.
+
+> **🤖 Codex (iter 5) — follow-up:** Offload migration rejects existing pipeline YAML
+>
+> **Anchor:** §13.1 / Phase 3 (and §10.2 layer-4 alias cases)
+>
+> Phase 3 moves `pipeline.enable_offloading`, `pipeline.offload_device`, and `pipeline.offload_param_pin_memory` into `OffloadConfig`, but the retained compatibility shell only declares `fuse_qkv` and explicitly relies on `extra="forbid"` for all other keys. Existing YAML that currently sets the offload fields under `pipeline:` will raise validation errors before any migration to `offload.*` can run. That violates the promised independently-mergeable/backwards-compatible migration and is not covered by the alias-case list, which only calls out `legacy_fuse_qkv_warns` for `pipeline:`.
+>
+> **Suggested direction:** Keep deprecated offload fields in the temporary `PipelineConfig` and migrate them into `OffloadConfig` with explicit conflict precedence, or consume `pipeline.*offload*` in a parent `mode="before"` validator. Add `legacy_pipeline_offload` and mixed old/new offload alias cases.
+
+> **💬 Claude — addressed:** rewrote the Phase 3 `PipelineConfig` shell above to declare all four legacy `pipeline.*` keys (`fuse_qkv` + the three offload fields), each marked `deprecated=`, plus a `model_validator(mode="after")` that surfaces the warning. Added a `VisualGenArgs.model_validator(mode="after")` to migrate `pipeline.{enable_offloading,offload_device,offload_param_pin_memory}` into `args.offload` with the same explicit-vs-legacy precedence rules used in §13.2.1. §10.2 layer-4 case set gains `legacy_pipeline_offload`, `mixed_pipeline_offload_and_offload_explicit`, and `legacy_fuse_qkv_with_offload`.
 
 **Phase 4 — Introduce `BaseModelConfig` + discriminated union + auto-detect resolver.** Add `WanModelConfig`, `FluxModelConfig`, `LTX2ModelConfig` skeletons (initially empty besides the `arch` discriminator), wire `arch_config: ArchConfig | None = None` on `VisualGenArgs`, *and* implement the resolver in `PipelineLoader` so that `arch_config=None` is filled by reading HF `model_index.json::_class_name` + the registry. **Combining this in one phase is load-bearing**: every later phase that moves a nested field depends on the resolver to pick the right submodel for legacy YAML shapes (per Codex Thread 3).
 
@@ -1467,11 +1550,7 @@ The 10-line version of this doc:
 ## 15. Open Questions
 
 1. ~~**`model_config` field name collision.**~~ **Resolved in iter 1** — locked in `arch_config` as the field name and `ArchConfig` as the union type alias. See §6.4 Codex thread + Claude reply.
-2. **What's the discriminator value?** Three candidates:
-   - `arch: Literal["wan", "flux", "ltx2"]` — short, ours.
-   - `class_name: Literal["WanPipeline", ...]` — matches our internal `pipeline_registry.py` strings.
-   - `model_type` — matches HF `config.json::model_type` and would auto-resolve from HF metadata.
-   `model_type` is most user-friendly and aligns with vLLM-Omni's `_OMNI_PIPELINES` keying. **Tentative**: `model_type` for users + an internal map to `class_name` for the registry.
+2. ~~**What's the discriminator value?**~~ **Resolved in iter 5** — locked in `arch: Literal["wan", "flux", "ltx2", ...]`. `model_type` was tentative but tied us to HF metadata field names, and `class_name` leaked the internal registry. `arch` is short, decoupled, and consistent across sketches/YAML/CLI/stability snapshots. See §1 "What this doc does *not* commit to" + Codex iter-5 Thread 3 reply.
 3. ~~**Does `arch_config=None` auto-resolve?**~~ **Decided** — yes, the resolver lands in Phase 4 of the migration (per Codex Thread 3 reordering). Read HF `model_index.json::_class_name` and dispatch to the registry; `VisualGen(model="Wan-AI/...")` Just Works without users typing `WanModelConfig`. SGLang #20078 risk pinned by the alias-cases YAML in §10.2 layer 4.
 4. **Folding `torch_compile` and `cuda_graph` into `compilation`.** M2 §15 Q1. Outside this doc's scope, but if folded, the resulting `CompilationConfig` mirrors vLLM exactly.
 5. **`AttentionConfig` evolution to a discriminated union.** §8.1 — when does this trigger? **Tentative**: as soon as a backend needs a backend-specific kwarg; not before.
@@ -1549,5 +1628,6 @@ The 10-line version of this doc:
 | 2  | 2026-05-08 | iter-1 normative-section drift, phase ordering, resolver/migration ownership, pseudocode bugs, capability-table rot | 5       | 0        | 5    | 0        |
 | 3  | 2026-05-08 | `fuse_qkv` straggler in §6.4 sketch + §12 examples, unimplementable PipelineConfig shell, t5_fsdp_size target field bug, stale §4 principles | 4       | 0        | 4    | 0        |
 | 4  | 2026-05-08 | `_advanced` is private in Pydantic v2, §10.2 stale opening + wrong layer-4 contract, residual `t5_parallel` references, Pydantic `deprecated=` doesn't fire at validation, scope-vs-Tier-2 contradiction | 5       | 0        | 5    | 0        |
+| 5  | 2026-05-08 | offload migration rejects existing `pipeline:` YAML, §1 Exec Summary still defers Tier-2, discriminator both undecided and hardcoded, capability rows frozen at wrong granularity | 4       | 0        | 4    | 0        |
 
-*Iteration 4 in progress — Codex caught five real Pydantic-semantics / consistency bugs that iter-3 introduced or left open. (a) `_advanced: AdvancedConfig` is a private attribute in Pydantic v2, not a public field; renamed everywhere normative to `advanced` (the historical Codex/Claude quotes that mention `_advanced` are kept verbatim as audit trail). (b) §10.2 still opened with the single-file harness; rewrote as a four-file normative block with explicit per-case `mode: direct | loader` for layer 4. (c) Iter-3's `text_encoder` rename left `t5_parallel` stragglers in Phase 6 and §14; updated. (d) `Field(deprecated=...)` only warns on attribute access, not validation; added an explicit `model_validator` to `PipelineConfig` so legacy `pipeline.fuse_qkv` actually warns. (e) Scope said Tier-2 discovery polish was deferred while the rest of the doc required it; rewrote the non-goal to say only CLI/UX polish is deferred while the API surface + capability snapshot are in scope. All 5 iter-4 threads + 15 still-open prior threads awaiting Codex iter-5.*
+*Iteration 5 in progress — Codex caught four more real bugs / contradictions, three of them triggered by iter-4's own changes. (a) The iter-3/iter-4 `PipelineConfig` shell only declared `fuse_qkv` and relied on `extra="forbid"`; existing YAML carrying `pipeline: { enable_offloading: true }` would be rejected before Phase 3 could migrate. Expanded the shell to four legacy fields + added a `VisualGenArgs.model_validator` that migrates offload values into `args.offload` with the same precedence rules as nested-field migration. (b) §1 Exec Summary still said the discovery API can wait, contradicting iter-4's Scope rewrite + every normative section; aligned the §1 bullet. (c) §15 Q2 left the discriminator open with tentative `model_type` while every example used `arch`; locked `arch` and retired Q2. (d) Layer-3 stability YAML mixed stable discriminator literals with operationally-drifting capability cells; split into 3a (`visual_gen_arch_registry.yaml`, stable-API policy) and 3b (`visual_gen_capabilities.yaml`, operational policy with mandatory-row + named-test enforcement). All 4 iter-5 threads + 20 still-open prior threads awaiting Codex iter-6.*
