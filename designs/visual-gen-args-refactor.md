@@ -908,30 +908,56 @@ extra_model_config:
 
 #### Load / dump API
 
-`VisualGenArgs` does not ship dedicated `from_yaml` / `to_yaml` classmethods; the load and dump path uses standard Pydantic v2 + PyYAML:
+`VisualGenArgs` ships two convenience classmethods that wrap the
+standard Pydantic v2 + PyYAML round-trip:
+
+```python
+from tensorrt_llm import VisualGenArgs
+
+# Load (preferred)
+args = VisualGenArgs.from_yaml("vg.yaml")
+
+# Dump (preferred)
+args.to_yaml("vg.out.yaml")
+```
+
+Implementation:
+
+```python
+@classmethod
+def from_yaml(cls, path: str | Path) -> "VisualGenArgs":
+    import yaml
+    with open(path) as f:
+        return cls(**(yaml.safe_load(f) or {}))
+
+def to_yaml(self, path: str | Path) -> None:
+    import yaml
+    with open(path, "w") as f:
+        yaml.safe_dump(
+            self.model_dump(exclude_none=True),
+            f, sort_keys=False,
+        )
+```
+
+Both helpers are thin — they centralize `exclude_none=True` and the
+preserved key order so the CLI side (and CI YAML comparisons) hit the
+same shape every time. PyYAML is already a TRT-LLM dependency
+(transitively via `pydantic-settings[yaml]` in `requirements.txt`), so
+no new package surface.
+
+For users who want the raw Pydantic path, the underlying idiom is
+unchanged:
 
 ```python
 import yaml
-from tensorrt_llm import VisualGenArgs
-
-# Load
 with open("vg.yaml") as f:
     args = VisualGenArgs(**yaml.safe_load(f))
 
-# Dump
 with open("vg.out.yaml", "w") as f:
     yaml.safe_dump(args.model_dump(exclude_none=True), f, sort_keys=False)
 ```
 
-`args.model_dump()` is Pydantic v2's native serializer. Pass
-`exclude_none=True` to omit unset optional fields (cleaner round-trips,
-fewer surprises when YAML is compared in CI). For schemas, use
-`VisualGenArgs.model_json_schema()`.
-
-If a `VisualGenArgs.from_yaml(path)` / `to_yaml(path)` classmethod pair
-proves useful for the CLI side (e.g., to centralize `exclude_none=True`
-and key ordering), it's a small additive enhancement that does not
-change the surface above — open question, see §15.
+For schemas, use `VisualGenArgs.model_json_schema()` (Pydantic v2 native).
 
 ### 12.4 CLI
 
@@ -1560,5 +1586,6 @@ VisualGen is pre-GA. The migration is a clean break.
 | 10 | 2026-05-11 | Owner (Zhenhua) — reversed direction on §6 (dict pass-through over typed discriminated union); restored `_config` suffix to match `LlmArgs`; folded `torch_compile` / `cuda_graph` flat into `compilation_config`; dropped `dtype`/`device`/offload/`fuse_qkv` as dead code; `TLLM_VG_*` env-var prefix; `skip_warmup` → `compilation_config`, `skip_components` → env var; dropped alias / deprecation shims; `--visual_gen_args` CLI primary | 23      | 23       | 0    | 0        |
 | 11 | 2026-05-11 | Owner (Zhenhua) — API-clarity pass: merged "recommendation" duplication (§1 short version + §14 list) into one consolidated **§14 Final Design — Public API** with complete class listings, namespace map, end-to-end example, decision-rationale table; added §14.2 collision analysis vs `LlmArgs` (resolved by folding `CudaGraphConfig`/`TorchCompileConfig` into `CompilationConfig` and namespacing sub-configs under `tensorrt_llm.visual_gen.*`) | 2       | 2        | 0    | 0        |
 | 12 | 2026-05-12 | PR #9 review round 1 — Owner (Zhenhua) feedback on the open PR: swap §13 ↔ §14 so Final Design (API) reads before Migration; correct top-level export list (verified against `origin/main`: drop `VisualGen*Error`, add `VisualGenMetrics`/`VisualGenOutput`/`ExtraParamSchema`); drop public `PipelineComponent` export (env-var-only); re-export `QuantConfig` from `tensorrt_llm.visual_gen`; move two derived quant flags off `VisualGenArgs` into the internal `DiffusionModelConfig`; drop redundant `dit_` prefix on `ParallelConfig` fields; document YAML load/dump idiom (`yaml.safe_load` + `VisualGenArgs(**dict)` + `args.model_dump(exclude_none=True)`). | 9       | 6        | 3    | 0        |
+| 13 | 2026-05-12 | PR #9 review round 2 — Owner follow-up on two open threads: (a) HF-id-vs-`_class_name` dispatch — clarified that LLM-side `MODEL_MAP` keys on HF `architectures[0]` (`automodel.py`, `models/__init__.py:139`), fine-tunes auto-dispatch via inherited architecture; proposed aligning VisualGen to the same shape (registry keyed by Diffusers `_class_name`, with `extra_model_config()` accepting HF id or path via internal resolution) — awaiting owner OK before editing §13.8. (b) `from_yaml`/`to_yaml` classmethods — verified PyYAML is already a TRT-LLM dep via `pydantic-settings[yaml]`; added the two classmethods to §12.3 per the reviewer's rule. | 2       | 1        | 1    | 0        |
 
-**Converged on 2026-05-11 after iteration 11; round 1 of PR review feedback applied 2026-05-12 (6 resolved, 3 open — 1 acknowledgment-only thread the owner may still want to push back on; 2 awaiting decisions on HF-id-vs-`_class_name` mapping and on adding `from_yaml`/`to_yaml` classmethods).** Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; owner-review iterations 10-11 raised 25 issues (all resolved) as a directional pivot + API-clarity follow-up; PR round 1 (this round) raised 9 (6 resolved, 3 awaiting owner direction). Severity decreased monotonically across the Codex iterations (high → medium → none). The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11 → PR round 1.
+**Converged on 2026-05-11 after iteration 11; rounds 1-2 of PR review feedback applied 2026-05-12 (7 resolved cumulatively, 2 still open — 1 acknowledgment-only thread the owner may still want to push back on; 1 awaiting decision on HF-id dispatch shape).** Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; owner-review iterations 10-11 raised 25 issues (all resolved) as a directional pivot + API-clarity follow-up; PR rounds 1-2 raised 9 (+2 follow-ups) total, of which 7 are resolved and 2 await owner direction. Severity decreased monotonically across the Codex iterations (high → medium → none). The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11 → PR round 1 → PR round 2.
