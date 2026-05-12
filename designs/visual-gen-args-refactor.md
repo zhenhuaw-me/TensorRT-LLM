@@ -49,7 +49,7 @@ without leaning on any single style choice prematurely.
 - **Migration plan** — direct edits without alias shims or deprecation
   cycles (VisualGen has no GA users yet).
 - **Lightweight discovery affordance** — `VisualGen.supported_models()` +
-  `VisualGen.extra_model_config(model)` over a registry keyed by Diffusers `_class_name` (mirrors LLM's `MODEL_MAP` keyed by HF `architectures[0]`)
+  `VisualGen.pipeline_config(model)` over a registry keyed by Diffusers `_class_name` (mirrors LLM's `MODEL_MAP` keyed by HF `architectures[0]`)
   model ID. No parallel schema-metadata system.
 
 ### Out of scope (non-goals)
@@ -144,13 +144,13 @@ Every new model adds more fields. Every new optimization adds more fields. Every
 
 ### The recommendation (one paragraph)
 
-**Composed cross-cutting Pydantic sub-configs (typed, `_config`-suffix naming to mirror `LlmArgs`) plus two dict overrides — `model_kwargs` (HF/Diffusers config overrides, mirrors `LlmArgs.model_kwargs`; loose) and `extra_model_config` (VisualGen pipeline runtime knobs; strict, resolved via a `_class_name`-keyed registry mirroring LLM's `MODEL_MAP`). Sub-configs live in `tensorrt_llm.visual_gen.*`, entry-point classes (`VisualGen`, `VisualGenArgs`, `VisualGenParams`) at top-level `tensorrt_llm.*` — namespace mirrors LLM exactly.**
+**Composed cross-cutting Pydantic sub-configs (typed, `_config`-suffix naming to mirror `LlmArgs`) plus a strict, `_class_name`-keyed dict `pipeline_config` for VisualGen pipeline runtime knobs (resolved via a registry mirroring LLM's `MODEL_MAP`). Sub-configs live in `tensorrt_llm.visual_gen.*`, entry-point classes (`VisualGen`, `VisualGenArgs`, `VisualGenParams`) at top-level `tensorrt_llm.*` — namespace mirrors LLM exactly.**
 
 The complete public API surface — every class, every field, every classmethod, every import path, namespace-collision analysis with `LlmArgs` — is laid out in **[§13 Final Design — Public API](#14-final-design--public-api)**. The high-level shape:
 
 - **Cross-cutting sub-configs stay typed and orthogonal**, with `_config`-suffix attribute names matching `LlmArgs`'s convention (`parallel_config`, `compilation_config`, `attention_config`, `cache_config`, `quant_config`). New optimization knobs go into the right sub-config.
 - **`CompilationConfig` is a flat umbrella** holding `resolutions`, `num_frames`, `skip_warmup`, plus folded-in `cuda_graph_*` and `torch_compile_*` flat fields. No nested `TorchCompileConfig` / `CudaGraphConfig` siblings — they disappear, their fields are absorbed as prefixed flat fields.
-- **Per-architecture config is two flat dicts**, resolved at load time via a registry keyed by Diffusers `_class_name` (matches today's `pipeline_registry.py`; mirrors LLM's `MODEL_MAP` keyed by `architectures[0]`). No `WanModelConfig` / `FluxModelConfig` Pydantic classes in the public namespace. `model_kwargs` overrides HF/Diffusers config values (loose, like `LlmArgs.model_kwargs`); `extra_model_config` carries VisualGen pipeline runtime knobs (strict — unknown keys raise). Discovery via `VisualGen.supported_models()` + `VisualGen.extra_model_config(model)`; the latter accepts HF id, local path, or `_class_name`.
+- **Per-architecture config is a flat dict `pipeline_config`**, resolved at load time via a registry keyed by Diffusers `_class_name` (matches today's `pipeline_registry.py`; mirrors LLM's `MODEL_MAP` keyed by `architectures[0]`). No `WanModelConfig` / `FluxModelConfig` Pydantic classes in the public namespace. Strict validation — unknown keys raise. Discovery via `VisualGen.supported_models()` (returns canonical HF ids) + `VisualGen.pipeline_config(model)`; the latter accepts HF id, local path, or `_class_name`.
 - **Debug-only knobs split by actual usage**: `skip_warmup` → `compilation_config.skip_warmup` (compile-adjacent); `skip_components` → env var `TLLM_VG_SKIP_COMP` (test-only, no production user); `enable_layerwise_nvtx_marker` → top-level flat field (mirrors `TorchLlmArgs`).
 - **Dead-code removal**: `pipeline.fuse_qkv`, `dtype`, `device`, and the three offload fields go away — verified unwired or hardcoded at `e527a9f785`. `PipelineConfig` class disappears entirely.
 - **Stability marker only**: every new field carries `Field(status="prototype")`. No `validation_alias`, no soft/hard deprecation cycle, no snapshot harness. VisualGen is pre-GA; the snapshot-test harness is a separate task.
@@ -300,7 +300,7 @@ Every nested sub-config attribute on `BaseLlmArgs` / `TorchLlmArgs` uses `_confi
 The principles below extend the M2 doc's principles to the args-specific concerns. They are *normative* statements of the post-refactor design.
 
 1. **Cross-cutting concerns get orthogonal sub-configs.** If a knob applies to every model and every backend (compilation, parallelism, attention, KV-cache-style memory, quant), it lives in its own typed Pydantic sub-config with the `_config` suffix. Sub-configs do not know about each other.
-2. **Architecture-specific config splits into two dicts.** Fields that are meaningful for one model are *not* top-level fields and *not* Pydantic classes in the public namespace. `args.model_kwargs` overrides HF/Diffusers config values (loose, mirrors `LlmArgs.model_kwargs`); `args.extra_model_config` carries VisualGen pipeline runtime knobs (strict — unknown keys raise). The registry that backs `extra_model_config` is keyed by Diffusers `_class_name`, mirroring LLM's `MODEL_MAP` keyed by HF `architectures[0]`.
+2. **Architecture-specific config is a dict.** Fields that are meaningful for one model are *not* top-level fields and *not* Pydantic classes in the public namespace. `args.pipeline_config: dict[str, Any]` carries VisualGen pipeline runtime knobs (strict — unknown keys raise) and is backed by a registry keyed by Diffusers `_class_name`, mirroring LLM's `MODEL_MAP` keyed by HF `architectures[0]`.
 3. **The args class is closed for modification, open for extension.** Adding a new model must not require editing `VisualGenArgs` or any cross-cutting sub-config. Every new *pipeline family* ships as a registry entry: `(class_name, pipeline_cls, defaults_dict, doc_string)`. Fine-tunes of an existing family need zero new code.
 4. **Internal state stays internal.** If a field is computed from another, it doesn't appear in the public schema. Use Pydantic's `PrivateAttr` (already used by `LlmArgs`) or move to `DiffusionModelConfig` (the internal merged config).
 5. **Flat sub-configs unless multi-axis nesting is genuinely needed.** No `args.compilation_config.torch_compile_config.enable_inductor` — three-hop access hurts discovery and ergonomics. `CompilationConfig` is a flat umbrella with `cuda_graph_*` and `torch_compile_*` prefixed fields. Nested sub-configs are reserved for discriminated unions (`CacheConfig`) and cases where the sub-component has a clear, separable lifecycle.
@@ -349,7 +349,7 @@ Note: `pipeline.fuse_qkv` is *not* an optimization knob to relocate — it's dea
 | **C3** | Per-model docstrings + class-level `inspect.signature` | Diffusers per-pipeline classes |
 | **C4** | A purpose-built `engine.list_supported_args(model)` API | The user's "discovery API" idea |
 
-For the cross-cutting parts, **C2** is free (Pydantic native). For the model-specific dicts, **C4** is the right answer — `VisualGen.supported_models()` lists registered Diffusers `_class_name`s (e.g., `"WanPipeline"`); `VisualGen.extra_model_config(model)` accepts an HF id, local path, or `_class_name` and returns the defaults dict. Source of truth is the registry.
+For the cross-cutting parts, **C2** is free (Pydantic native). For the model-specific dicts, **C4** is the right answer — `VisualGen.supported_models()` lists registered Diffusers `_class_name`s (e.g., `"WanPipeline"`); `VisualGen.pipeline_config(model)` accepts an HF id, local path, or `_class_name` and returns the defaults dict. Source of truth is the registry.
 
 ### Axis D — How is stability enforced?
 
@@ -433,7 +433,7 @@ class VisualGenArgs(StrictBaseModel):
 
 (Axes: A3, B2, C2+C4, D3.)
 
-Cross-cutting concerns get typed Pydantic sub-configs with the `_config` suffix matching `LlmArgs`. Per-architecture concerns are two flat dicts (`model_kwargs` for HF/Diffusers config overrides; `extra_model_config` for VisualGen pipeline runtime knobs), with `extra_model_config` validated at load time against defaults from a registry keyed by Diffusers `_class_name`. Discovery via two classmethods on `VisualGen`.
+Cross-cutting concerns get typed Pydantic sub-configs with the `_config` suffix matching `LlmArgs`. Per-architecture concerns are a flat `pipeline_config: dict[str, Any]`, validated at load time against defaults from a registry keyed by Diffusers `_class_name`. Discovery via two classmethods on `VisualGen`.
 
 **Sketch**:
 
@@ -472,20 +472,8 @@ class VisualGenArgs(StrictBaseModel):
     # ── Observability (flat at top-level, mirrors TorchLlmArgs) ───
     enable_layerwise_nvtx_marker: bool = Field(default=False, status="prototype")
 
-    # ── HF / Diffusers config overrides (mirrors LlmArgs.model_kwargs) ─
-    model_kwargs: Optional[Dict[str, Any]] = Field(
-        default=None, status="prototype",
-        description=(
-            "Optional parameters overriding values in the model's HF / "
-            "Diffusers config file (e.g., model_index.json, the transformer's "
-            "config.json). Precedence: (1) model_kwargs, (2) model config "
-            "file, (3) model class defaults. Unknown keys are ignored "
-            "(matches LlmArgs.model_kwargs semantics at llm_args.py:2915)."
-        ),
-    )
-
     # ── VisualGen pipeline runtime knobs (resolved via _class_name registry) ─
-    extra_model_config: dict[str, Any] = Field(
+    pipeline_config: dict[str, Any] = Field(
         default_factory=dict,
         status="prototype",
         description=(
@@ -493,24 +481,12 @@ class VisualGenArgs(StrictBaseModel):
             "Diffusers config file (e.g., text_encoder_path for LTX-2, "
             "refiner_dp_size for LTX-2 two-stage). Keys must match the "
             "registry entry for the resolved pipeline class; unknown keys "
-            "raise at load time. Discover via VisualGen.extra_model_config(model)."
+            "raise at load time. Discover via VisualGen.pipeline_config(model)."
         ),
     )
 ```
 
-The split between `model_kwargs` and `extra_model_config` mirrors the
-distinction between HF/Diffusers-config overrides and pipeline-specific
-runtime knobs:
-
-- `model_kwargs` overrides values that are *in* the checkpoint's
-  config file (e.g., `num_hidden_layers`, `hidden_size`). Loose
-  validation — unknown keys are ignored, matching LLM's behavior, so
-  forward-compat with new HF fields is free.
-- `extra_model_config` carries pipeline-specific knobs that aren't in
-  any HF/Diffusers config file (e.g., `text_encoder_path` for LTX-2,
-  `refiner_dp_size` for LTX-2 two-stage, `text_encoder_fsdp_size` for
-  Wan). Strict validation — unknown keys raise so typos surface at
-  load time; the registry's `defaults` is the schema-by-example.
+`pipeline_config` carries pipeline-specific knobs that aren't in any HF/Diffusers config file (e.g., `text_encoder_path` for LTX-2, `refiner_dp_size` for LTX-2 two-stage, `text_encoder_fsdp_size` for Wan). Strict validation — unknown keys raise so typos surface at load time; the registry's `defaults` is the schema-by-example. (If a future need for HF/Diffusers config overrides emerges, the right shape is a separate dict mirroring `LlmArgs.model_kwargs` at `llm_args.py:2915` — deliberately deferred until a real use case appears.)
 
 And the registry, internal:
 
@@ -520,7 +496,8 @@ And the registry, internal:
 @dataclass
 class ModelEntry:
     pipeline_cls: type             # the pipeline class to construct
-    defaults:     dict[str, Any]   # default extra_model_config knobs (schema-by-example)
+    hf_ids:       list[str]        # canonical HF ids for this family (for VisualGen.supported_models())
+    defaults:     dict[str, Any]   # default pipeline_config knobs (schema-by-example)
     doc:          str              # short docstring for the discovery API
 
 # Keyed by Diffusers `_class_name` (from model_index.json), mirroring
@@ -543,23 +520,38 @@ And discovery API on `VisualGen`:
 class VisualGen:
     @classmethod
     def supported_models(cls) -> list[str]:
-        """Return the list of registered Diffusers `_class_name`s
-        (e.g., 'WanPipeline', 'Flux2Pipeline', 'LTX2Pipeline')."""
-        return list(_MODEL_REGISTRY.keys())
+        """Return the canonical HF model IDs across all registered
+        pipeline families (e.g., 'Wan-AI/Wan2.1-T2V-14B',
+        'black-forest-labs/FLUX.1-dev', 'Lightricks/LTX-Video', ...).
+
+        Fine-tunes of these families auto-dispatch via the inherited
+        `_class_name` and need not appear in this list.
+        """
+        return [hf_id for e in _MODEL_REGISTRY.values() for hf_id in e.hf_ids]
 
     @classmethod
-    def extra_model_config(cls, model: str | Path) -> dict[str, Any]:
-        """Return the default extra_model_config knobs for the given model.
+    def pipeline_config(cls, model: str | Path) -> dict[str, Any]:
+        """Return the default pipeline_config knobs for the given model.
 
         `model` may be:
-        - A registered Diffusers `_class_name` directly (e.g., 'WanPipeline').
-        - An HF model id or local checkpoint path; resolved internally via
-          the same `_detect_from_checkpoint` logic as PipelineLoader
-          (reads `model_index.json::_class_name`, falls back to
-          safetensors metadata for LTX-2's native single-file format).
+        - An HF model id (e.g., 'Wan-AI/Wan2.1-T2V-14B') — looked up in
+          the registry's `hf_ids` list.
+        - A local checkpoint path — resolved by reading
+          `model_index.json::_class_name` (with a safetensors-metadata
+          fallback for LTX-2's native single-file format), the same way
+          `PipelineLoader` does.
+        - A registered Diffusers `_class_name` directly (e.g.,
+          'WanPipeline') — returned without resolution.
         """
-        if model in _MODEL_REGISTRY:                # direct class_name match
+        # 1. HF id match (most common user-facing path).
+        for entry in _MODEL_REGISTRY.values():
+            if model in entry.hf_ids:
+                return dict(entry.defaults)
+        # 2. Direct _class_name match.
+        if model in _MODEL_REGISTRY:
             return dict(_MODEL_REGISTRY[model].defaults)
+        # 3. Local path → resolve _class_name via the same logic
+        #    PipelineLoader uses.
         class_name = AutoPipeline._detect_from_checkpoint(model)
         return dict(_MODEL_REGISTRY[class_name].defaults)
 ```
@@ -569,17 +561,13 @@ Load-time merge in `PipelineLoader`:
 ```python
 class_name = AutoPipeline._detect_from_checkpoint(args.model)
 entry = _MODEL_REGISTRY[class_name]
-unknown = set(args.extra_model_config) - set(entry.defaults)
+unknown = set(args.pipeline_config) - set(entry.defaults)
 if unknown:
     raise ValueError(
-        f"Unknown extra_model_config keys for {class_name} ({args.model}): "
+        f"Unknown pipeline_config keys for {class_name} ({args.model}): "
         f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
     )
-resolved = {**entry.defaults, **args.extra_model_config}
-# model_kwargs feeds the HF / Diffusers config overrides on the
-# already-loaded model config object, separately:
-if args.model_kwargs:
-    diffusion_model_config.update(args.model_kwargs)   # unknown keys silently ignored
+resolved = {**entry.defaults, **args.pipeline_config}
 pipeline = entry.pipeline_cls(**resolved, ...)
 ```
 
@@ -593,7 +581,7 @@ pipeline = entry.pipeline_cls(**resolved, ...)
 
 **Cons**:
 - **No IDE completion for model-specific keys** — typos fail at load time, not at edit time. Mitigated by strict-on-unknown-keys + the discovery API. This is the explicit trade-off the design owner chose.
-- **No JSON-schema for `extra_model_config` keys** — `VisualGenArgs.model_json_schema()` shows `extra_model_config: dict`, not the per-pipeline contents. OpenAPI generation would need to walk the registry separately. (`model_kwargs` has the same gap, but loose validation makes that less load-bearing.)
+- **No JSON-schema for `pipeline_config` keys** — `VisualGenArgs.model_json_schema()` shows `pipeline_config: dict`, not the per-pipeline contents. OpenAPI generation would need to walk the registry separately.
 - Validation moves from Pydantic to the pipeline class. The strict unknown-key check is the safety net; pipeline classes own deeper validation (type coercion, range checks).
 
 **Verdict**: **Recommended.** Matches the design owner's explicit preference for dict pass-through, minimizes public API surface, mirrors LLM-serving precedent, keeps the cross-cutting typed surface that already works.
@@ -614,7 +602,7 @@ The dict + registry path is simpler than both and matches the LLM side.
 This section walks every field that exists today. The dispositions are:
 
 - **Keep** on `VisualGenArgs` (cross-cutting, stable).
-- **Move to `extra_model_config` registry defaults** (per-pipeline-family, in the registry's `defaults` dict for the relevant `_class_name` entry).
+- **Move to `pipeline_config` registry defaults** (per-pipeline-family, in the registry's `defaults` dict for the relevant `_class_name` entry).
 - **Move to env var** (`TLLM_VG_*`) — testing/debug, not part of the production contract.
 - **Make internal** — derived from another field, surfaced via `PrivateAttr` or moved to `DiffusionModelConfig`.
 - **Delete** — dead code, verified unwired at `e527a9f785`.
@@ -636,7 +624,7 @@ This section walks every field that exists today. The dispositions are:
 | `spatial_upsampler_path` | flat `str` | **Move to `LTX2Pipeline` registry entry's defaults** | (Variant resolution into the two-stage pipeline happens in `LTX2Pipeline.resolve_variant()`.) |
 | `distilled_lora_path` | flat `str` | **Move to `LTX2Pipeline` registry entry's defaults** | The LTX-2 stage-2 LoRA merge is implementation-internal to `pipeline_ltx2_two_stages.py:45-172, 617-664` — not a general LoRA story. See Open Question on a Diffusers-style runtime `load_lora_weights()` API. |
 
-These are the textbook example of architecture-specific creep (§2.2.1). They become part of the `LTX2Pipeline` registry entry's `defaults` dict. Wan and Flux users no longer see them anywhere. LTX-2 users discover them via `VisualGen.extra_model_config("Lightricks/LTX-Video")` (HF id resolved to `_class_name` internally) or `VisualGen.extra_model_config("LTX2Pipeline")`.
+These are the textbook example of architecture-specific creep (§2.2.1). They become part of the `LTX2Pipeline` registry entry's `defaults` dict. Wan and Flux users no longer see them anywhere. LTX-2 users discover them via `VisualGen.pipeline_config("Lightricks/LTX-Video")` (HF id resolved to `_class_name` internally) or `VisualGen.pipeline_config("LTX2Pipeline")`.
 
 ### 7.3 Component skip + warmup skip
 
@@ -716,9 +704,9 @@ After these splits, `PipelineConfig` is empty and the class disappears entirely.
 
 The net effect:
 
-- `VisualGenArgs` shrinks from "4 flat + 4 LTX-2 + 2 test + 2 internal + 7 sub-configs" (19 surface concepts) to **"2 flat + 5 cross-cutting sub-configs + 1 flat observability + 2 dict overrides (`model_kwargs` + `extra_model_config`)"** (10 surface concepts).
+- `VisualGenArgs` shrinks from "4 flat + 4 LTX-2 + 2 test + 2 internal + 7 sub-configs" (19 surface concepts) to **"2 flat + 5 cross-cutting sub-configs + 1 flat observability + 1 `pipeline_config` dict"** (9 surface concepts).
 - The set of fields a Wan user sees in their schema goes from ~50 to ~25, and every field they see is meaningful for Wan.
-- Pipeline-runtime knobs live in the registry (keyed by Diffusers `_class_name`); users discover them via `VisualGen.extra_model_config(model)` which accepts HF id, local path, or `_class_name`.
+- Pipeline-runtime knobs live in the registry (keyed by Diffusers `_class_name`); users discover them via `VisualGen.pipeline_config(model)` which accepts HF id, local path, or `_class_name`.
 
 ---
 
@@ -777,33 +765,42 @@ This covers cross-cutting fields and sub-configs without writing any new API. To
 class VisualGen:
     @classmethod
     def supported_models(cls) -> list[str]:
-        """Return the list of registered HF model IDs.
-
-        Returns the registry keys verbatim (e.g.,
-        "Wan-AI/Wan2.1-T2V-14B"), not invented labels."""
-        return list(_MODEL_REGISTRY.keys())
+        """Return the canonical HF model IDs across all registered
+        pipeline families. Fine-tunes auto-dispatch via inherited
+        `_class_name` and need not appear in this list."""
+        return [hf_id for e in _MODEL_REGISTRY.values() for hf_id in e.hf_ids]
 
     @classmethod
-    def extra_model_config(cls, hf_id: str) -> dict[str, Any]:
-        """Return the defaults dict for the given HF model ID.
+    def pipeline_config(cls, model: str | Path) -> dict[str, Any]:
+        """Return the defaults dict for the given model.
 
-        Raises KeyError if the model is not registered. The returned
+        `model` may be an HF id (looked up in each entry's `hf_ids`
+        list), a local checkpoint path (resolved to `_class_name` via
+        `_detect_from_checkpoint`), or a registered `_class_name`
+        directly. Raises KeyError if no entry matches. The returned
         dict is a copy — mutating it does not affect the registry."""
-        return dict(_MODEL_REGISTRY[hf_id].defaults)
+        for entry in _MODEL_REGISTRY.values():
+            if model in entry.hf_ids:
+                return dict(entry.defaults)
+        if model in _MODEL_REGISTRY:
+            return dict(_MODEL_REGISTRY[model].defaults)
+        class_name = AutoPipeline._detect_from_checkpoint(model)
+        return dict(_MODEL_REGISTRY[class_name].defaults)
 ```
 
 **Usage**:
 
 ```python
 >>> VisualGen.supported_models()
-['Wan-AI/Wan2.1-T2V-14B', 'black-forest-labs/FLUX.1-dev', 'Lightricks/LTX-Video', ...]
+['Wan-AI/Wan2.1-T2V-14B', 'Wan-AI/Wan2.1-T2V-1.3B', 'black-forest-labs/FLUX.1-dev',
+ 'Lightricks/LTX-Video', ...]
 
->>> VisualGen.extra_model_config("Wan-AI/Wan2.1-T2V-14B")
+>>> VisualGen.pipeline_config("Wan-AI/Wan2.1-T2V-14B")
 {'text_encoder_fsdp_size': 1, ...}
 
 >>> args = VisualGenArgs(
 ...     model="Wan-AI/Wan2.1-T2V-14B",
-...     extra_model_config={"text_encoder_fsdp_size": 4},
+...     pipeline_config={"text_encoder_fsdp_size": 4},
 ... )
 ```
 
@@ -811,17 +808,17 @@ The `defaults` dict on each registry entry is **the schema-by-example**: it list
 
 ### 9.3 Strict unknown-key handling
 
-At load time, `PipelineLoader` merges `args.extra_model_config` over `entry.defaults` and rejects unknown keys:
+At load time, `PipelineLoader` merges `args.pipeline_config` over `entry.defaults` and rejects unknown keys:
 
 ```python
 entry = _MODEL_REGISTRY[args.model]
-unknown = set(args.extra_model_config) - set(entry.defaults)
+unknown = set(args.pipeline_config) - set(entry.defaults)
 if unknown:
     raise ValueError(
-        f"Unknown extra_model_config keys for {args.model}: {sorted(unknown)}. "
+        f"Unknown pipeline_config keys for {args.model}: {sorted(unknown)}. "
         f"Valid keys: {sorted(entry.defaults)}"
     )
-resolved = {**entry.defaults, **args.extra_model_config}
+resolved = {**entry.defaults, **args.pipeline_config}
 ```
 
 This is the safety net that replaces IDE completion. Typos surface at load time with the valid key set in the error message.
@@ -830,7 +827,7 @@ This is the safety net that replaces IDE completion. Typos surface at load time 
 
 - **Per-model JSON schema** — derivable from `entry.defaults` by walking the dict, but no canonical method on `VisualGen`. Add later if OpenAPI generation needs it.
 - **Capability schema** — "is FA4 + NVFP4 + cache_dit supported on Wan 1.3B on H100?" — out of scope. Resolvable today only by attempting load + warmup; add a capability table later if/when needed.
-- **Pretty-printer / `--describe` CLI** — `print(VisualGen.extra_model_config(hf_id))` is sufficient for now. Polish layer; deferred.
+- **Pretty-printer / `--describe` CLI** — `print(VisualGen.pipeline_config(model))` is sufficient for now. Polish layer; deferred.
 
 ---
 
@@ -847,9 +844,9 @@ class VisualGenArgs(StrictBaseModel):
     model:    str                  = Field(description="HF id or local path.")
     revision: str | None           = Field(default=None, status="prototype")
     # ...
-    extra_model_config: dict[str, Any] = Field(
+    pipeline_config: dict[str, Any] = Field(
         default_factory=dict, status="prototype",
-        description="Model-specific overrides; see VisualGen.extra_model_config(hf_id).",
+        description="Model-specific overrides; see VisualGen.pipeline_config(model).",
     )
 ```
 
@@ -927,7 +924,7 @@ The recommended shape (§6.3) preserves all current ingestion paths.
 args = VisualGenArgs(
     model="Wan-AI/Wan2.1-T2V-14B",
     parallel_config=ParallelConfig(cfg_size=2),
-    extra_model_config={"text_encoder_fsdp_size": 4},
+    pipeline_config={"text_encoder_fsdp_size": 4},
 )
 ```
 
@@ -937,7 +934,7 @@ args = VisualGenArgs(
 args = VisualGenArgs(**config_dict)
 ```
 
-`extra_model_config` is just a `dict[str, Any]` field; Pydantic deserializes it without any custom logic. Validation against the registry happens at `PipelineLoader.load(args)` (after `args.model` is known).
+`pipeline_config` is just a `dict[str, Any]` field; Pydantic deserializes it without any custom logic. Validation against the registry happens at `PipelineLoader.load(args)` (after `args.model` is known).
 
 ### 12.3 YAML
 
@@ -950,7 +947,7 @@ compilation_config:
     - [480, 832]
   num_frames: [33, 81]
   cuda_graph_max_batch_size: 4
-extra_model_config:
+pipeline_config:
   text_encoder_fsdp_size: 4
 ```
 
@@ -1132,9 +1129,9 @@ class VisualGenArgs(StrictBaseModel):
 
     Cross-cutting concerns are typed sub-configs with `_config` suffix
     (mirrors `LlmArgs`). Per-architecture knobs live in
-    `extra_model_config: dict[str, Any]`, validated against the
+    `pipeline_config: dict[str, Any]`, validated against the
     registry's defaults at load time. Discover via
-    `VisualGen.supported_models()` / `VisualGen.extra_model_config(hf_id)`.
+    `VisualGen.supported_models()` / `VisualGen.pipeline_config(model)`.
     """
 
     # ── Loading ──────────────────────────────────────────────────
@@ -1154,12 +1151,12 @@ class VisualGenArgs(StrictBaseModel):
         description="Emit per-layer NVTX ranges for nsys profiling.")
 
     # ── Per-architecture knobs (dict; resolved via HF-id registry at load) ─
-    extra_model_config: dict[str, Any] = Field(
+    pipeline_config: dict[str, Any] = Field(
         default_factory=dict, status="prototype",
         description=(
             "Model-specific overrides. Keys must match the registry entry "
             "for `model`; unknown keys raise at load time. "
-            "Discover via VisualGen.extra_model_config(hf_id)."
+            "Discover via VisualGen.pipeline_config(model)."
         ),
     )
 ```
@@ -1315,15 +1312,16 @@ Internal data structure; not part of the public top-level API surface. Exported 
 ```python
 # tensorrt_llm/_torch/visual_gen/registry.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 @dataclass
 class ModelEntry:
     """One entry in the VisualGen model registry."""
-    pipeline_cls: type             # the pipeline class to construct at load
-    defaults:     dict[str, Any]   # default extra_model_config knobs (schema-by-example)
-    doc:          str              # short docstring shown by discovery tooling
+    pipeline_cls: type                            # the pipeline class to construct at load
+    hf_ids:       list[str] = field(default_factory=list)   # canonical HF ids for VisualGen.supported_models()
+    defaults:     dict[str, Any] = field(default_factory=dict)  # default pipeline_config knobs (schema-by-example)
+    doc:          str = ""                        # short docstring shown by discovery tooling
 
 # Keyed by Diffusers `_class_name`, NOT by HF model id. ~3-5 entries
 # total — one per pipeline family (matches today's `pipeline_registry.py`
@@ -1344,11 +1342,17 @@ register_model(
     "WanPipeline",
     ModelEntry(
         pipeline_cls=WanPipeline,
+        hf_ids=[
+            "Wan-AI/Wan2.1-T2V-14B",
+            "Wan-AI/Wan2.1-T2V-1.3B",
+            "Wan-AI/Wan2.2-T2V-14B",
+            # ... canonical T2V checkpoints. Fine-tunes auto-dispatch via
+            # inherited `_class_name='WanPipeline'` and need not be listed.
+        ],
         defaults={
             "text_encoder_fsdp_size": 1,
         },
-        doc="Wan text-to-video family (T2V variants). DiT + T5 encoder. "
-            "Includes all Wan checkpoints with `_class_name='WanPipeline'`.",
+        doc="Wan text-to-video family (T2V variants). DiT + T5 encoder.",
     ),
 )
 
@@ -1356,6 +1360,13 @@ register_model(
     "LTX2Pipeline",
     ModelEntry(
         pipeline_cls=LTX2Pipeline,
+        hf_ids=[
+            "Lightricks/LTX-Video",
+            "Lightricks/LTX-Video-13B-Distilled",
+            # ... canonical LTX-Video checkpoints (single-stage and two-stage
+            # share this entry; LTX2Pipeline.resolve_variant() picks the
+            # right subclass at load time).
+        ],
         defaults={
             # LTX-2 pipeline runtime knobs
             "text_encoder_path":      "",
@@ -1378,12 +1389,11 @@ register_model(
 )
 ```
 
-The `defaults` dict is the schema-by-example for `extra_model_config`: it lists every pipeline-runtime knob the family accepts, with its default. There is no separate JSON-schema. The registry is the source of truth.
+The `defaults` dict is the schema-by-example for `pipeline_config`: it lists every pipeline-runtime knob the family accepts, with its default. There is no separate JSON-schema. The registry is the source of truth.
 
-**Note on the two override surfaces**:
+`hf_ids` is the canonical-checkpoints list — what `VisualGen.supported_models()` returns to the user. It is *not* the dispatch key (that's `_class_name`); it is purely a discovery hint. Fine-tunes inherit the parent's `_class_name` and dispatch automatically without needing to appear in `hf_ids`.
 
-- Keys in `extra_model_config` (e.g., `text_encoder_path`, `refiner_dp_size`) must appear in the entry's `defaults` dict — strict validation at load time.
-- Keys in `model_kwargs` (e.g., `num_hidden_layers`, `hidden_size`) target the model's HF/Diffusers config object directly and are *not* validated against the registry — loose, matching LLM (`LlmArgs.model_kwargs` at `llm_args.py:2915`).
+**Validation**: keys in `pipeline_config` (e.g., `text_encoder_path`, `refiner_dp_size`) must appear in the entry's `defaults` dict — strict validation at load time.
 
 ### 13.9 Discovery API on `VisualGen`
 
@@ -1393,31 +1403,38 @@ Two classmethods. Both read the registry directly.
 class VisualGen:
     @classmethod
     def supported_models(cls) -> list[str]:
-        """Return the list of registered Diffusers `_class_name`s
-        (e.g., 'WanPipeline', 'Flux2Pipeline', 'LTX2Pipeline').
-
-        These are pipeline family names, not HF model IDs — fine-tunes
-        of the same family share an entry, so the list is small (~3-5
-        entries) rather than one row per checkpoint."""
-        return list(_MODEL_REGISTRY.keys())
+        """Return the canonical HF model IDs across all registered
+        pipeline families. Fine-tunes auto-dispatch and need not appear
+        in this list (dispatch is keyed by Diffusers `_class_name`,
+        which fine-tunes inherit from their parent)."""
+        return [hf_id for e in _MODEL_REGISTRY.values() for hf_id in e.hf_ids]
 
     @classmethod
-    def extra_model_config(cls, model: str | Path) -> dict[str, Any]:
-        """Return the default extra_model_config knobs for the given model.
+    def pipeline_config(cls, model: str | Path) -> dict[str, Any]:
+        """Return the default pipeline_config knobs for the given model.
 
         `model` may be:
-        - A registered Diffusers `_class_name` (e.g., 'WanPipeline'),
-          returned directly.
-        - An HF model id or local checkpoint path; resolved internally
-          via the same `_detect_from_checkpoint` logic as PipelineLoader
-          (reads `model_index.json::_class_name`, falls back to
-          safetensors metadata for LTX-2's native single-file format).
+        - An HF model id (e.g., 'Wan-AI/Wan2.1-T2V-14B') — looked up in
+          each entry's `hf_ids` list. The common user path.
+        - A local checkpoint path — resolved by reading
+          `model_index.json::_class_name` (with a safetensors-metadata
+          fallback for LTX-2's native single-file format), the same way
+          `PipelineLoader` does.
+        - A registered Diffusers `_class_name` (e.g., 'WanPipeline') —
+          returned directly without resolution.
 
         Raises KeyError if no entry matches. The returned dict is a
         copy — mutating it does not affect the registry.
         """
+        # 1. HF id match (most common user-facing path).
+        for entry in _MODEL_REGISTRY.values():
+            if model in entry.hf_ids:
+                return dict(entry.defaults)
+        # 2. Direct _class_name match.
         if model in _MODEL_REGISTRY:
             return dict(_MODEL_REGISTRY[model].defaults)
+        # 3. Local path — resolve _class_name via the same logic
+        #    PipelineLoader uses.
         class_name = AutoPipeline._detect_from_checkpoint(model)
         return dict(_MODEL_REGISTRY[class_name].defaults)
 ```
@@ -1426,18 +1443,19 @@ Usage:
 
 ```python
 >>> VisualGen.supported_models()
-['WanPipeline', 'Flux2Pipeline', 'LTX2Pipeline', ...]
+['Wan-AI/Wan2.1-T2V-14B', 'Wan-AI/Wan2.1-T2V-1.3B', 'Wan-AI/Wan2.2-T2V-14B',
+ 'black-forest-labs/FLUX.1-dev', 'black-forest-labs/FLUX.2-dev',
+ 'Lightricks/LTX-Video', 'Lightricks/LTX-Video-13B-Distilled', ...]
 
->>> VisualGen.extra_model_config("WanPipeline")        # by class_name
+>>> VisualGen.pipeline_config("Wan-AI/Wan2.1-T2V-14B")   # by HF id (common path)
 {'text_encoder_fsdp_size': 1}
 
->>> VisualGen.extra_model_config("Wan-AI/Wan2.1-T2V-14B")   # by HF id (resolved internally)
-{'text_encoder_fsdp_size': 1}
+>>> VisualGen.pipeline_config("/path/to/my-finetuned-wan-checkpoint")  # by local path
+{'text_encoder_fsdp_size': 1}   # resolved to WanPipeline via model_index.json
 
 >>> args = VisualGenArgs(
 ...     model="Wan-AI/Wan2.1-T2V-14B",
-...     model_kwargs={"num_hidden_layers": 12},           # HF/Diffusers config override
-...     extra_model_config={"text_encoder_fsdp_size": 4}, # pipeline runtime knob
+...     pipeline_config={"text_encoder_fsdp_size": 4},
 ... )
 ```
 
@@ -1446,15 +1464,13 @@ Load-time validation in `PipelineLoader` (not public API, specified here for ref
 ```python
 class_name = AutoPipeline._detect_from_checkpoint(args.model)
 entry = _MODEL_REGISTRY[class_name]
-unknown = set(args.extra_model_config) - set(entry.defaults)
+unknown = set(args.pipeline_config) - set(entry.defaults)
 if unknown:
     raise ValueError(
-        f"Unknown extra_model_config keys for {class_name} ({args.model}): "
+        f"Unknown pipeline_config keys for {class_name} ({args.model}): "
         f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
     )
-resolved = {**entry.defaults, **args.extra_model_config}
-if args.model_kwargs:
-    diffusion_model_config.update(args.model_kwargs)   # loose: unknown keys ignored
+resolved = {**entry.defaults, **args.pipeline_config}
 pipeline = entry.pipeline_cls(**resolved, ...)
 ```
 
@@ -1482,10 +1498,8 @@ args = VisualGenArgs(
     cache_config=TeaCacheConfig(teacache_thresh=0.2),
     quant_config=QuantConfig(),
     enable_layerwise_nvtx_marker=False,
-    # HF / Diffusers config overrides (loose; mirrors LlmArgs.model_kwargs)
-    model_kwargs={"num_hidden_layers": 12},
     # VisualGen pipeline runtime knobs (strict; from the registry's defaults)
-    extra_model_config={"text_encoder_fsdp_size": 4},
+    pipeline_config={"text_encoder_fsdp_size": 4},
 )
 
 engine = VisualGen(args=args)
@@ -1508,9 +1522,7 @@ attention_config:
 cache_config:
   cache_backend: teacache
   teacache_thresh: 0.2
-model_kwargs:
-  num_hidden_layers: 12
-extra_model_config:
+pipeline_config:
   text_encoder_fsdp_size: 4
 ```
 
@@ -1519,13 +1531,12 @@ extra_model_config:
 | Choice | Why | See |
 | --- | --- | --- |
 | Dispatch registry keyed by Diffusers `_class_name` | Mirrors LLM's `MODEL_MAP` keyed by HF `architectures[0]`; ~3-5 entries; fine-tunes auto-dispatch via inherited `_class_name` | §5 Axis A → A3; §13.8 |
-| Two override surfaces: `model_kwargs` + `extra_model_config` | `model_kwargs` mirrors LLM's HF-config overrides (loose); `extra_model_config` is for VisualGen pipeline runtime knobs not in any HF/Diffusers config (strict) | §13.3, §13.8 |
-| `extra_model_config(model)` accepts HF id / path / `_class_name` | User ergonomics keep working (query by HF id); internal `_detect_from_checkpoint` does the id → class-name resolution | §13.9 |
+| `pipeline_config(model)` accepts HF id / path / `_class_name` | User ergonomics keep working (query by HF id); internal `_detect_from_checkpoint` does the id → class-name resolution | §13.9 |
 | Cross-cutting concerns stay typed sub-configs | Universal precedent; Pydantic gives validation + IDE completion for free | §5 Axis B → B2 |
 | `_config`-suffix naming | Matches `LlmArgs` (`kv_cache_config`, `cuda_graph_config`, `quant_config`, ...) | §3.2 Takeaway 5; §7.5 |
 | `CompilationConfig` as flat umbrella | Single discoverable surface; avoids three-hop `args.compilation_config.torch_compile_config.X` | §8.1 |
 | Sub-configs under `tensorrt_llm.visual_gen.*`, not top-level | Mirrors LLM's `tensorrt_llm.llmapi.*` pattern; eliminates same-name collisions | §13.1, §13.2 |
-| Strict unknown-key handling on `extra_model_config` | Safety net for typos in lieu of IDE completion; differs from LLM's loose `model_kwargs` because our keys are pipeline-defined, not HF-defined | §9.3 |
+| Strict unknown-key handling on `pipeline_config` | Safety net for typos in lieu of IDE completion. (LLM's analogous `model_kwargs` at `llm_args.py:2915` is loose because its keys are HF-defined and forward-compat matters; VisualGen's keys are pipeline-defined, so strictness wins.) | §9.3 |
 | `Field(status="prototype")` on every new field | Reuses LLM-side marker; full snapshot harness deferred | §10 |
 | No alias/deprecation shims | Pre-GA refactor; direct edits | §10.2, §13.2 |
 | `TLLM_VG_*` env-var prefix | Shorter than `TLLM_VISUALGEN_*`; matches `TLLM_*` brevity convention | §11 |
@@ -1568,7 +1579,7 @@ These four field removals are independent; can be done together or split. `Pipel
 
 **Phase 7 — Introduce the model registry.** Add `tensorrt_llm/_torch/visual_gen/registry.py` with `register_model(class_name, ModelEntry)`, keyed by Diffusers `_class_name` (mirrors today's `pipeline_registry.py` and LLM's `MODEL_MAP[architectures[0]]`). Populate one entry per currently-supported pipeline family (`WanPipeline`, `WanImageToVideoPipeline`, `FluxPipeline`, `Flux2Pipeline`, `LTX2Pipeline`), with their pipeline classes and empty-or-populated `defaults` dicts.
 
-**Phase 8 — Add `model_kwargs` + `extra_model_config` to `VisualGenArgs`.** `model_kwargs: Optional[Dict[str, Any]]` for loose HF/Diffusers-config overrides (mirrors `LlmArgs.model_kwargs`). `extra_model_config: dict[str, Any]` for strict pipeline-runtime knobs. Update `PipelineLoader` to detect `_class_name` from the checkpoint (reuse `AutoPipeline._detect_from_checkpoint`), look up the registry entry, validate `extra_model_config` unknown keys against `entry.defaults`, merge, and pass to `entry.pipeline_cls(...)`. `model_kwargs` flows separately into the loaded `DiffusionModelConfig`.
+**Phase 8 — Add `pipeline_config: dict[str, Any]` to `VisualGenArgs`.** Strict validation. Update `PipelineLoader` to detect `_class_name` from the checkpoint (reuse `AutoPipeline._detect_from_checkpoint`), look up the registry entry, validate `pipeline_config` unknown keys against `entry.defaults`, merge, and pass the merged dict to `entry.pipeline_cls(...)`.
 
 **Phase 9 — Move per-arch fields into registry defaults.**
 
@@ -1578,7 +1589,7 @@ These four field removals are independent; can be done together or split. `Pipel
 
 Delete the corresponding fields from `VisualGenArgs` / `ParallelConfig` in the same PR.
 
-**Phase 10 — Add the discovery API.** `VisualGen.supported_models()` returns the registered `_class_name`s; `VisualGen.extra_model_config(model)` accepts an HF id, local path, or `_class_name` and returns the entry's `defaults` dict (HF id / path resolved via `AutoPipeline._detect_from_checkpoint`).
+**Phase 10 — Add the discovery API.** `VisualGen.supported_models()` returns the registered `_class_name`s; `VisualGen.pipeline_config(model)` accepts an HF id, local path, or `_class_name` and returns the entry's `defaults` dict (HF id / path resolved via `AutoPipeline._detect_from_checkpoint`).
 
 **Phase 11 — Update CLI.** Add `--visual_gen_args` as primary in `commands/serve.py` and `bench/benchmark/visual_gen.py`; keep `--extra_visual_gen_options` as alias.
 
@@ -1600,10 +1611,10 @@ VisualGen is pre-GA. The migration is a clean break.
 3. ~~**`fuse_qkv` defaults per arch.**~~ **Resolved** — moot. `fuse_qkv` is dead code; `qkv_mode` is hard-coded per attention site in the per-model transformer constructors. If/when QKV-fusion-as-config returns, it would be a knob on `attention_config`, not per-arch.
 4. **When to bring back `dtype`.** Today the field is dead (hardcoded bf16). Adding it back requires the loader to actually resolve `"auto"` against per-model defaults. **Tentative**: add when a second model needs a non-bf16 default (e.g., fp16 for some legacy variant) or when fp8/fp4 inference is wired through.
 5. **`AttentionConfig` evolution to a discriminated union.** §8.2 — when does this trigger? **Tentative**: as soon as a backend needs a backend-specific kwarg; not before.
-6. **Promoting `extra_model_config` keys to typed fields.** When a model-specific key becomes used by 3+ commits and stable for 1+ release, should it get promoted to a typed sub-config field somewhere? **Tentative**: judgment-call; promote to a model-specific *typed* class only if multiple models share the key. Otherwise keep in the registry defaults.
+6. **Promoting `pipeline_config` keys to typed fields.** When a model-specific key becomes used by 3+ commits and stable for 1+ release, should it get promoted to a typed sub-config field somewhere? **Tentative**: judgment-call; promote to a model-specific *typed* class only if multiple models share the key. Otherwise keep in the registry defaults.
 7. **CLI dotted overrides.** vLLM-style `--visual_gen_args config.yaml` + `--compilation_config.cuda_graph_max_batch_size=4` overrides would be valuable but is not blocking. **Tentative**: defer to a follow-up PR.
-8. **Out-of-tree model registration.** Should `register_model(hf_id, entry)` be a public function? This enables third-party plugins but commits us to the registry contract (entry shape, HF id matching strategy, namespace collisions). **Tentative**: not in this milestone; revisit if a plugin ecosystem emerges.
-9. **Relationship with `DiffusionModelConfig` (the internal merged config).** `DiffusionModelConfig.from_pretrained` reads HF + args and produces the merged config. With dict-based model-specific knobs, the merging logic becomes a flat dict update — cleaner. **Tentative**: keep `DiffusionModelConfig` internal as M2 §10.3 proposes; the merge logic reads from `args.extra_model_config` directly.
+8. **Out-of-tree model registration.** Should `register_model(class_name, entry)` be a public function? This enables third-party plugins but commits us to the registry contract (entry shape, `hf_ids` curation, namespace collisions). **Tentative**: not in this milestone; revisit if a plugin ecosystem emerges.
+9. **Relationship with `DiffusionModelConfig` (the internal merged config).** `DiffusionModelConfig.from_pretrained` reads HF + args and produces the merged config. With dict-based model-specific knobs, the merging logic becomes a flat dict update — cleaner. **Tentative**: keep `DiffusionModelConfig` internal as M2 §10.3 proposes; the merge logic reads from `args.pipeline_config` directly.
 10. **HF model ID matching strategy.** Exact-only today (§9.2). When checkpoint variants explode (each fine-tune as a separate HF id with the same config schema), pattern matching may be worth adding. **Tentative**: exact-only for v1; add prefix / wildcard support later if registration boilerplate becomes a pain point.
 
 ---
@@ -1682,7 +1693,9 @@ VisualGen is pre-GA. The migration is a clean break.
 | 10 | 2026-05-11 | Owner (Zhenhua) — reversed direction on §6 (dict pass-through over typed discriminated union); restored `_config` suffix to match `LlmArgs`; folded `torch_compile` / `cuda_graph` flat into `compilation_config`; dropped `dtype`/`device`/offload/`fuse_qkv` as dead code; `TLLM_VG_*` env-var prefix; `skip_warmup` → `compilation_config`, `skip_components` → env var; dropped alias / deprecation shims; `--visual_gen_args` CLI primary | 23      | 23       | 0    | 0        |
 | 11 | 2026-05-11 | Owner (Zhenhua) — API-clarity pass: merged "recommendation" duplication (§1 short version + §14 list) into one consolidated **§14 Final Design — Public API** with complete class listings, namespace map, end-to-end example, decision-rationale table; added §14.2 collision analysis vs `LlmArgs` (resolved by folding `CudaGraphConfig`/`TorchCompileConfig` into `CompilationConfig` and namespacing sub-configs under `tensorrt_llm.visual_gen.*`) | 2       | 2        | 0    | 0        |
 | 12 | 2026-05-12 | PR #9 review round 1 — Owner (Zhenhua) feedback on the open PR: swap §13 ↔ §14 so Final Design (API) reads before Migration; correct top-level export list (verified against `origin/main`: drop `VisualGen*Error`, add `VisualGenMetrics`/`VisualGenOutput`/`ExtraParamSchema`); drop public `PipelineComponent` export (env-var-only); re-export `QuantConfig` from `tensorrt_llm.visual_gen`; move two derived quant flags off `VisualGenArgs` into the internal `DiffusionModelConfig`; drop redundant `dit_` prefix on `ParallelConfig` fields; document YAML load/dump idiom (`yaml.safe_load` + `VisualGenArgs(**dict)` + `args.model_dump(exclude_none=True)`). | 9       | 6        | 3    | 0        |
-| 13 | 2026-05-12 | PR #9 review round 2 — Owner follow-up on two open threads: (a) HF-id-vs-`_class_name` dispatch — clarified that LLM-side `MODEL_MAP` keys on HF `architectures[0]` (`automodel.py`, `models/__init__.py:139`), fine-tunes auto-dispatch via inherited architecture; proposed aligning VisualGen to the same shape (registry keyed by Diffusers `_class_name`, with `extra_model_config()` accepting HF id or path via internal resolution) — awaiting owner OK before editing §13.8. (b) `from_yaml`/`to_yaml` classmethods — verified PyYAML is already a TRT-LLM dep via `pydantic-settings[yaml]`; added the two classmethods to §12.3 per the reviewer's rule. | 2       | 1        | 1    | 0        |
-| 14 | 2026-05-12 | PR #9 review round 3 — Owner clarified that LLM does have per-model user-side config (`LlmArgs.model_kwargs` at `llm_args.py:2915`, loose HF-config overrides) and asked for examples; OK'd two-dict design + strict `extra_model_config`. Doc updated: registry rekeyed by Diffusers `_class_name` (mirrors LLM's `MODEL_MAP[architectures[0]]`); ~3-5 entries instead of one-per-checkpoint; fine-tunes auto-dispatch. Added `model_kwargs: Optional[Dict[str, Any]]` to `VisualGenArgs` (loose, mirrors `LlmArgs.model_kwargs`) for HF/Diffusers config overrides; kept `extra_model_config` strict for VisualGen pipeline runtime knobs (registry-validated). `VisualGen.extra_model_config(model)` now accepts HF id / local path / `_class_name`. §1, §4, §5, §6, §7, §13.3, §13.8, §13.9, §13.10, §13.11, §14 Phases 7-10 all updated to reflect the two-dict + `_class_name`-keyed shape. | 1       | 1        | 0    | 0        |
+| 13 | 2026-05-12 | PR #9 review round 2 — Owner follow-up on two open threads: (a) HF-id-vs-`_class_name` dispatch — clarified that LLM-side `MODEL_MAP` keys on HF `architectures[0]` (`automodel.py`, `models/__init__.py:139`), fine-tunes auto-dispatch via inherited architecture; proposed aligning VisualGen to the same shape (registry keyed by Diffusers `_class_name`, with `pipeline_config()` accepting HF id or path via internal resolution) — awaiting owner OK before editing §13.8. (b) `from_yaml`/`to_yaml` classmethods — verified PyYAML is already a TRT-LLM dep via `pydantic-settings[yaml]`; added the two classmethods to §12.3 per the reviewer's rule. | 2       | 1        | 1    | 0        |
+| 14 | 2026-05-12 | PR #9 review round 3 — Owner clarified that LLM does have per-model user-side config (`LlmArgs.model_kwargs` at `llm_args.py:2915`, loose HF-config overrides) and asked for examples; OK'd two-dict design + strict `pipeline_config`. Doc updated: registry rekeyed by Diffusers `_class_name` (mirrors LLM's `MODEL_MAP[architectures[0]]`); ~3-5 entries instead of one-per-checkpoint; fine-tunes auto-dispatch. Added `model_kwargs: Optional[Dict[str, Any]]` to `VisualGenArgs` (loose, mirrors `LlmArgs.model_kwargs`) for HF/Diffusers config overrides; kept `pipeline_config` strict for VisualGen pipeline runtime knobs (registry-validated). `VisualGen.pipeline_config(model)` now accepts HF id / local path / `_class_name`. §1, §4, §5, §6, §7, §13.3, §13.8, §13.9, §13.10, §13.11, §14 Phases 7-10 all updated to reflect the two-dict + `_class_name`-keyed shape. | 1       | 1        | 0    | 0        |
 
-**Converged on 2026-05-11 after iteration 11; rounds 1-3 of PR review feedback applied 2026-05-12 (8 resolved cumulatively, 1 still open — the acknowledgment-only thread the owner may still want to push back on).** Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; owner-review iterations 10-11 raised 25 issues (all resolved) as a directional pivot + API-clarity follow-up; PR rounds 1-3 raised 9 (+3 follow-ups across rounds 2-3) total, of which 8 are resolved and 1 awaits a reviewer push-back decision. Severity decreased monotonically across the Codex iterations (high → medium → none). The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11 → PR round 1 → PR round 2 → PR round 3.
+| 15 | 2026-05-12 | PR #9 chat round 4 — Owner reversed the two-dict design: drop `model_kwargs` entirely (revisit only when a real use case appears); rename `extra_model_config` field + `VisualGen.extra_model_config()` method to `pipeline_config` (Pydantic-safe; `model_config` collides with `ConfigDict` class attribute). `supported_models()` reworked to return canonical HF ids (not `_class_name`s) via a new `ModelEntry.hf_ids: list[str]` field; dispatch still keys on `_class_name` so fine-tunes auto-resolve. `VisualGen.pipeline_config(model)` now resolves HF id → `_class_name` via `entry.hf_ids` lookup first, then `_detect_from_checkpoint` for local paths, then direct `_class_name`. | 4       | 4        | 0    | 0        |
+
+**Converged on 2026-05-11 after iteration 11; rounds 1-3 of PR review feedback applied 2026-05-12 (8 resolved cumulatively on the PR), round 4 was an owner directive in chat that simplified the design back to one dict + HF-id-returning discovery. 1 thread still open on the PR — the acknowledgment-only thread the owner may still want to push back on.** Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; owner-review iterations 10-11 raised 25 issues (all resolved) as a directional pivot + API-clarity follow-up; PR rounds 1-3 + chat round 4 raised 13 issues, of which 12 are resolved and 1 awaits a reviewer push-back decision. Severity decreased monotonically across the Codex iterations (high → medium → none). The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11 → PR round 1 → PR round 2 → PR round 3 → chat round 4.
