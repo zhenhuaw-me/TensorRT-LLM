@@ -120,8 +120,8 @@ without leaning on any single style choice prematurely.
 10. [Cross-Cutting: Stability Marker](#10-cross-cutting-stability-marker)
 11. [Cross-Cutting: Debug Knobs vs. Public Args](#11-cross-cutting-debug-knobs-vs-public-args)
 12. [Cross-Cutting: YAML, CLI, dict Ingestion](#12-cross-cutting-yaml-cli-dict-ingestion)
-13. [Migration Plan](#13-migration-plan)
-14. [Final Design — Public API](#14-final-design--public-api)
+13. [Final Design — Public API](#13-final-design--public-api)
+14. [Migration Plan](#14-migration-plan)
 15. [Open Questions](#15-open-questions)
 16. [Appendix: Source Links](#16-appendix-source-links)
 
@@ -146,7 +146,7 @@ Every new model adds more fields. Every new optimization adds more fields. Every
 
 **Composed cross-cutting Pydantic sub-configs (typed, `_config`-suffix naming to mirror `LlmArgs`) plus a flat `extra_model_config: dict[str, Any]` pass-through resolved by an HF-id registry for model-specific knobs. Sub-configs live in `tensorrt_llm.visual_gen.*`, entry-point classes (`VisualGen`, `VisualGenArgs`, `VisualGenParams`) at top-level `tensorrt_llm.*` — namespace mirrors LLM exactly.**
 
-The complete public API surface — every class, every field, every classmethod, every import path, namespace-collision analysis with `LlmArgs` — is laid out in **[§14 Final Design — Public API](#14-final-design--public-api)**. The high-level shape:
+The complete public API surface — every class, every field, every classmethod, every import path, namespace-collision analysis with `LlmArgs` — is laid out in **[§13 Final Design — Public API](#14-final-design--public-api)**. The high-level shape:
 
 - **Cross-cutting sub-configs stay typed and orthogonal**, with `_config`-suffix attribute names matching `LlmArgs`'s convention (`parallel_config`, `compilation_config`, `attention_config`, `cache_config`, `quant_config`). New optimization knobs go into the right sub-config.
 - **`CompilationConfig` is a flat umbrella** holding `resolutions`, `num_frames`, `skip_warmup`, plus folded-in `cuda_graph_*` and `torch_compile_*` flat fields. No nested `TorchCompileConfig` / `CudaGraphConfig` siblings — they disappear, their fields are absorbed as prefixed flat fields.
@@ -876,7 +876,7 @@ The recommended shape (§6.3) preserves all current ingestion paths.
 ```python
 args = VisualGenArgs(
     model="Wan-AI/Wan2.1-T2V-14B",
-    parallel_config=ParallelConfig(dit_cfg_size=2),
+    parallel_config=ParallelConfig(cfg_size=2),
     extra_model_config={"text_encoder_fsdp_size": 4},
 )
 ```
@@ -894,7 +894,7 @@ args = VisualGenArgs(**config_dict)
 ```yaml
 model: "Wan-AI/Wan2.1-T2V-14B"
 parallel_config:
-  dit_cfg_size: 2
+  cfg_size: 2
 compilation_config:
   resolutions:
     - [480, 832]
@@ -905,6 +905,33 @@ extra_model_config:
 ```
 
 `yaml.safe_load` + `VisualGenArgs(**dict)` works directly.
+
+#### Load / dump API
+
+`VisualGenArgs` does not ship dedicated `from_yaml` / `to_yaml` classmethods; the load and dump path uses standard Pydantic v2 + PyYAML:
+
+```python
+import yaml
+from tensorrt_llm import VisualGenArgs
+
+# Load
+with open("vg.yaml") as f:
+    args = VisualGenArgs(**yaml.safe_load(f))
+
+# Dump
+with open("vg.out.yaml", "w") as f:
+    yaml.safe_dump(args.model_dump(exclude_none=True), f, sort_keys=False)
+```
+
+`args.model_dump()` is Pydantic v2's native serializer. Pass
+`exclude_none=True` to omit unset optional fields (cleaner round-trips,
+fewer surprises when YAML is compared in CI). For schemas, use
+`VisualGenArgs.model_json_schema()`.
+
+If a `VisualGenArgs.from_yaml(path)` / `to_yaml(path)` classmethod pair
+proves useful for the CLI side (e.g., to centralize `exclude_none=True`
+and key ordering), it's a small additive enhancement that does not
+change the surface above — open question, see §15.
 
 ### 12.4 CLI
 
@@ -932,67 +959,11 @@ For future `trtllm-serve` work, the vLLM `FlexibleArgumentParser` pattern (`--vi
 
 ---
 
-## 13. Migration Plan
-
-### 13.1 Sequencing
-
-The refactor breaks into independent phases. Each is mergeable on its own and testable in isolation. **No backwards-compatibility shims** — direct edits, users update their YAMLs.
-
-**Phase 1 — Move `VisualGenArgs` and sub-configs to `tensorrt_llm/visual_gen/args.py`.** No structural change yet. Just move out of `_torch/visual_gen/config.py` per M2 §3.1 / §9 Option C. Keep re-exports from the old location for one release (only to avoid breaking internal imports). Adopt `Field(status="prototype")` on all fields.
-
-**Phase 2 — Rename to `_config` suffix.** Rename `compilation → compilation_config`, `parallel → parallel_config`, `attention → attention_config`, `cache → cache_config`, `torch_compile → (folded into compilation_config)`, `cuda_graph → (folded into compilation_config)`. `quant_config` already has the suffix. Direct rename; users update YAMLs.
-
-**Phase 3 — Fold `torch_compile` and `cuda_graph` into `compilation_config`.** Both become flat prefixed fields on `CompilationConfig` (`cuda_graph_batch_sizes`, `torch_compile_enable_inductor`, etc.). Update consumers in `PipelineLoader`.
-
-**Phase 4 — Delete dead-code fields.**
-
-- `dtype` (overridden to bf16 by `DiffusionModelConfig.torch_dtype`).
-- `device` (LLM has no analogue; we're CUDA-only).
-- `pipeline.fuse_qkv` (no production reader).
-- `pipeline.enable_offloading`, `pipeline.offload_device`, `pipeline.offload_param_pin_memory` (zero consumers).
-
-These four field removals are independent; can be done together or split. `PipelineConfig` is empty after the offload / fuse_qkv removals and disappears.
-
-**Phase 5 — Internal-state cleanup.** Move `dynamic_weight_quant`, `force_dynamic_quantization` to `PrivateAttr`.
-
-**Phase 6 — Move test/debug knobs.**
-
-- `skip_warmup` → `compilation_config.skip_warmup`.
-- `skip_components` → env var `TLLM_VG_SKIP_COMP`; update the test fixtures.
-- `pipeline.enable_layerwise_nvtx_marker` → top-level flat `VisualGenArgs.enable_layerwise_nvtx_marker`.
-
-**Phase 7 — Introduce the model registry.** Add `tensorrt_llm/_torch/visual_gen/registry.py` with `register_model(hf_id, ModelEntry)`. Populate entries for all currently-supported HF model IDs (Wan T2V/I2V variants, Flux variants, LTX-Video variants), with their pipeline classes and empty-or-populated `defaults` dicts.
-
-**Phase 8 — Add `extra_model_config: dict[str, Any]` to `VisualGenArgs`.** Update `PipelineLoader` to look up the registry entry by `args.model`, validate unknown keys against `entry.defaults`, merge, and pass the merged dict to `entry.pipeline_cls(...)`.
-
-**Phase 9 — Move per-arch fields into registry defaults.**
-
-- LTX-2 paths (`text_encoder_path`, `spatial_upsampler_path`, `distilled_lora_path`) → defaults for LTX-2 HF IDs.
-- `parallel.refiner_dit_*` (7 fields) → defaults for LTX-2 two-stage HF IDs.
-- `parallel.t5_fsdp_size` → defaults for Wan HF IDs.
-
-Delete the corresponding fields from `VisualGenArgs` / `ParallelConfig` in the same PR.
-
-**Phase 10 — Add the discovery API.** `VisualGen.supported_models()` + `VisualGen.extra_model_config(hf_id)` classmethods.
-
-**Phase 11 — Update CLI.** Add `--visual_gen_args` as primary in `commands/serve.py` and `bench/benchmark/visual_gen.py`; keep `--extra_visual_gen_options` as alias.
-
-### 13.2 What we *don't* do for compat
-
-- No `validation_alias` / `AliasChoices` for renames.
-- No `Field(deprecated=...)` markers for removed fields.
-- No soft-removal warning window.
-- No backwards-compat YAML parsing for old field names.
-
-VisualGen is pre-GA. The migration is a clean break.
-
----
-
-## 14. Final Design — Public API
+## 13. Final Design — Public API
 
 This section is the complete API contract this refactor lands. Every public class, every field, every classmethod, every import path, plus the namespace-collision analysis against `LlmArgs`. Source of truth for downstream readers, tooling, and docs.
 
-### 14.1 API namespace & exports
+### 13.1 API namespace & exports
 
 The public namespace mirrors the LLM-side split: entry-point classes at top-level, sub-configs in the dedicated sub-package.
 
@@ -1004,35 +975,43 @@ from tensorrt_llm import (
     VisualGenArgs,          # engine-level config (this doc's main subject)
     VisualGenParams,        # per-request params (M2)
     VisualGenResult,        # output type (M2)
-    VisualGenError,         # construction/load errors
-    VisualGenParamsError,   # request-validation errors
+    VisualGenOutput,        # output type (M2)
+    VisualGenMetrics,       # metrics type (M2)
+    ExtraParamSchema,       # per-model extra-params schema (M2)
 )
 ```
+
+(Matches the seven names re-exported by `tensorrt_llm/__init__.py` on
+`origin/main`. The earlier `VisualGen*Error` classes were dropped from
+the public API in `tensorrt_llm.llmapi`; construction / load failures
+surface as standard `ValueError` / `pydantic.ValidationError`.)
 
 **Sub-package `tensorrt_llm.visual_gen.*` — sub-configs + registry helpers**:
 
 ```python
 from tensorrt_llm.visual_gen import (
-    CompilationConfig,      # §14.4 — flat compilation umbrella
-    ParallelConfig,         # §14.5 — DiT-shaped parallelism
-    AttentionConfig,        # §14.6
-    CacheConfig,            # §14.7 — discriminated union TeaCacheConfig | CacheDiTConfig
+    CompilationConfig,      # §13.4 — flat compilation umbrella
+    ParallelConfig,         # §13.5 — DiT-shaped parallelism
+    AttentionConfig,        # §13.6
+    CacheConfig,            # §13.7 — discriminated union TeaCacheConfig | CacheDiTConfig
     TeaCacheConfig,
     CacheDiTConfig,
-    PipelineComponent,      # enum used in TLLM_VG_SKIP_COMP values
-    ModelEntry,             # registry entry shape (§14.8)
+    ModelEntry,             # registry entry shape (§13.8)
+    QuantConfig,            # re-exported from tensorrt_llm.llmapi for convenience
 )
 ```
 
-**Shared with LLM** — imported from `tensorrt_llm.llmapi.*`:
+`PipelineComponent` is deliberately *not* exposed publicly — the
+`TLLM_VG_SKIP_COMP` env var takes comma-separated strings, and the
+enum parsing is internal to `PipelineLoader`.
 
-```python
-from tensorrt_llm.llmapi import QuantConfig   # reused as VisualGenArgs.quant_config
-```
+`QuantConfig` is **re-exported** from `tensorrt_llm.visual_gen` (same
+class object as `tensorrt_llm.llmapi.QuantConfig`); users can import
+it from either namespace. The `from tensorrt_llm.llmapi import QuantConfig`
+path remains canonical for LLM users; VisualGen users get a single
+`from tensorrt_llm.visual_gen import ...` line.
 
-`QuantConfig` is the only sub-config VisualGen reuses verbatim from the LLM side. Everything else is VisualGen-owned.
-
-### 14.2 Naming collision vs `LlmArgs`
+### 13.2 Naming collision vs `LlmArgs`
 
 LLM today exports its sub-configs at `tensorrt_llm.llmapi.*` and its entry-point classes (`LLM`, `LlmArgs`, `TorchLlmArgs`, `TrtLlmArgs`) at top-level `tensorrt_llm.*`. VisualGen mirrors this split: entry-points at top-level, sub-configs in the sub-package.
 
@@ -1048,7 +1027,7 @@ After this refactor, the relevant class names — and whether they exist in both
 | `CudaGraphConfig` | yes (3 fields: `batch_sizes`, `max_batch_size`, `enable_padding`) | **none after this refactor** (folded into `CompilationConfig`) | Was a same-name collision before; **resolved by the fold** |
 | `TorchCompileConfig` | yes (6 fields: `enable_fullgraph`, `enable_inductor`, `enable_piecewise_cuda_graph`, `capture_num_tokens`, `enable_userbuffers`, `max_num_streams`) | **none after this refactor** (folded into `CompilationConfig`) | Same — **resolved by the fold** |
 
-**Verdict: no public name collision after the refactor.** Before, VisualGen and LLM both had `CudaGraphConfig` and `TorchCompileConfig` classes with different field sets — a latent foot-gun if either side ever exported them at top-level. Folding both into VisualGen's `CompilationConfig` (§14.4) eliminates the only same-name collision.
+**Verdict: no public name collision after the refactor.** Before, VisualGen and LLM both had `CudaGraphConfig` and `TorchCompileConfig` classes with different field sets — a latent foot-gun if either side ever exported them at top-level. Folding both into VisualGen's `CompilationConfig` (§13.4) eliminates the only same-name collision.
 
 A user wanting both engines in the same script writes:
 
@@ -1061,7 +1040,7 @@ from tensorrt_llm.llmapi   import QuantConfig    # shared
 
 No name shadowing — the imports come from different namespaces. `VgParallelConfig` aliasing is optional (LLM doesn't export a `ParallelConfig` at all today), shown only as a pattern for any same-name additions in the future.
 
-### 14.3 `VisualGenArgs` — top-level engine config
+### 13.3 `VisualGenArgs` — top-level engine config
 
 ```python
 # tensorrt_llm/visual_gen/args.py
@@ -1107,13 +1086,19 @@ class VisualGenArgs(StrictBaseModel):
             "Discover via VisualGen.extra_model_config(hf_id)."
         ),
     )
-
-    # ── Internal (not user-set; populated by validators) ─────────
-    _dynamic_weight_quant:       bool = PrivateAttr(default=False)
-    _force_dynamic_quantization: bool = PrivateAttr(default=False)
 ```
 
-### 14.4 `CompilationConfig` — flat umbrella
+The two derived flags `dynamic_weight_quant` and `force_dynamic_quantization`
+(populated by today's `_parse_quant_config_dict` validator) **do not
+live on `VisualGenArgs`** — they move to the internal
+`DiffusionModelConfig` (the merged config that `PipelineLoader` builds
+from `VisualGenArgs` + HF metadata, at `config.py:570` on
+`origin/main`). `DiffusionModelConfig` is already the home for
+derived/merged state in today's code; the two flags are a clean
+addition there. `VisualGenArgs` carries no `PrivateAttr` for them,
+since they are not even instance-private to the user-facing class.
+
+### 13.4 `CompilationConfig` — flat umbrella
 
 Absorbs today's `CudaGraphConfig` (1 field) and `TorchCompileConfig` (3 fields) as prefixed flat fields, plus the existing `resolutions` / `num_frames` warmup-shape config and the new `skip_warmup`.
 
@@ -1147,7 +1132,7 @@ class CompilationConfig(StrictBaseModel):
 
 Field renaming convention: today's `CudaGraphConfig.enable_cuda_graph` → `cuda_graph_enable`; today's `TorchCompileConfig.enable_torch_compile` → `torch_compile_enable`; the rest just gain the `torch_compile_` prefix. Discovery becomes one config to read; ergonomics are `args.compilation_config.cuda_graph_enable` instead of `args.cuda_graph.enable_cuda_graph`.
 
-### 14.5 `ParallelConfig` — DiT-shaped parallelism
+### 13.5 `ParallelConfig` — DiT-shaped parallelism
 
 Cross-cutting DiT parallelism for every diffusion model. Model-specific parallel knobs (LTX-2 stage-2 refiner, Wan T5 encoder) move to the registry's `defaults` dict — they are *not* on this class anymore.
 
@@ -1155,32 +1140,36 @@ Cross-cutting DiT parallelism for every diffusion model. Model-specific parallel
 class ParallelConfig(StrictBaseModel):
     """Parallelism axes shared across DiT-shaped diffusion models.
 
-    Per-architecture parallel knobs (LTX-2 refiner_dit_*, Wan t5_fsdp_size)
-    live in the registry's defaults dict (§14.8), not here.
+    Field names drop today's `dit_` prefix — the class name already
+    says DiT-shaped, so the prefix is redundant on every field. Users
+    write `parallel_config.dp_size`, not `parallel_config.dit_dp_size`.
+
+    Per-architecture parallel knobs (LTX-2 stage-2 refiner, Wan T5
+    encoder) live in the registry's defaults dict (§13.8), not here.
     """
 
     # ── VAE parallelism ─────────────────────────────────────────
     enable_parallel_vae:    bool                       = Field(default=True,    status="prototype")
     parallel_vae_split_dim: Literal["width", "height"] = Field(default="width", status="prototype")
 
-    # ── DiT parallelism axes ────────────────────────────────────
-    dit_dp_size:         int = Field(default=1, ge=1, status="prototype",
+    # ── DiT parallelism axes (prefix dropped per the rename above) ─
+    dp_size:         int = Field(default=1, ge=1, status="prototype",
         description="Data parallelism degree.")
-    dit_tp_size:         int = Field(default=1, ge=1, status="prototype",
+    tp_size:         int = Field(default=1, ge=1, status="prototype",
         description="Tensor parallelism degree. Not yet implemented.")
-    dit_ulysses_size:    int = Field(default=1, ge=1, status="prototype",
+    ulysses_size:    int = Field(default=1, ge=1, status="prototype",
         description="Ulysses head-sharding degree.")
-    dit_ring_size:       int = Field(default=1, ge=1, status="prototype",
+    ring_size:       int = Field(default=1, ge=1, status="prototype",
         description="Ring attention context parallelism. Not yet implemented.")
-    dit_attn2d_row_size: int = Field(default=1, ge=1, status="prototype",
+    attn2d_row_size: int = Field(default=1, ge=1, status="prototype",
         description="Attention2D row parallelism degree.")
-    dit_attn2d_col_size: int = Field(default=1, ge=1, status="prototype",
+    attn2d_col_size: int = Field(default=1, ge=1, status="prototype",
         description="Attention2D col parallelism degree.")
-    dit_cfg_size:        int = Field(default=1, ge=1, status="prototype",
+    cfg_size:        int = Field(default=1, ge=1, status="prototype",
         description="CFG (classifier-free guidance) batch parallelism.")
-    dit_fsdp_size:       int = Field(default=1, ge=1, status="prototype",
+    fsdp_size:       int = Field(default=1, ge=1, status="prototype",
         description="FSDP sharding degree for DiT weights.")
-    dit_dim_order:       str = Field(default=DEFAULT_DIM_ORDER, status="prototype",
+    dim_order:       str = Field(default=DEFAULT_DIM_ORDER, status="prototype",
         description="Outermost-to-innermost ordering of parallel axes for "
                     "the device mesh; innermost = most contiguous ranks.")
 
@@ -1200,7 +1189,7 @@ class ParallelConfig(StrictBaseModel):
 - `refiner_dit_dp_size`, `refiner_dit_tp_size`, `refiner_dit_ulysses_size`, `refiner_dit_ring_size`, `refiner_dit_cp_size`, `refiner_dit_cfg_size`, `refiner_dit_fsdp_size` — all move to the LTX-2 two-stage registry entry's defaults dict.
 - `t5_fsdp_size` — moves to the Wan registry entries' defaults dict.
 
-### 14.6 `AttentionConfig`
+### 13.6 `AttentionConfig`
 
 ```python
 class AttentionConfig(StrictBaseModel):
@@ -1213,7 +1202,7 @@ class AttentionConfig(StrictBaseModel):
     )
 ```
 
-### 14.7 `CacheConfig` — discriminated union (unchanged from today)
+### 13.7 `CacheConfig` — discriminated union (unchanged from today)
 
 ```python
 class BaseCacheConfig(StrictBaseModel):
@@ -1241,7 +1230,7 @@ CacheConfig = Annotated[
 
 This is the only sub-config that is *already* a discriminated union in today's code. Preserved as-is; the only change is adding `status="prototype"` markers on the individual fields.
 
-### 14.8 Model registry & `ModelEntry`
+### 13.8 Model registry & `ModelEntry`
 
 Internal data structure; not part of the public top-level API surface. Exported from `tensorrt_llm.visual_gen.*` for inspection / testing.
 
@@ -1304,7 +1293,7 @@ register_model(
 
 The `defaults` dict is the schema-by-example: it lists every knob the pipeline accepts, with its default. There is no separate JSON-schema. The registry is the source of truth.
 
-### 14.9 Discovery API on `VisualGen`
+### 13.9 Discovery API on `VisualGen`
 
 Two classmethods. Both read the registry directly.
 
@@ -1354,7 +1343,7 @@ resolved = {**entry.defaults, **args.extra_model_config}
 pipeline = entry.pipeline_cls(**resolved, ...)
 ```
 
-### 14.10 End-to-end import & construction example
+### 13.10 End-to-end import & construction example
 
 ```python
 from tensorrt_llm import VisualGen, VisualGenArgs
@@ -1366,7 +1355,7 @@ from tensorrt_llm.llmapi import QuantConfig
 args = VisualGenArgs(
     model="Wan-AI/Wan2.1-T2V-14B",
     revision=None,
-    parallel_config=ParallelConfig(dit_cfg_size=2, dit_ulysses_size=2),
+    parallel_config=ParallelConfig(cfg_size=2, ulysses_size=2),
     compilation_config=CompilationConfig(
         resolutions=[(480, 832), (720, 1280)],
         num_frames=[33, 81],
@@ -1389,8 +1378,8 @@ YAML equivalent:
 ```yaml
 model: "Wan-AI/Wan2.1-T2V-14B"
 parallel_config:
-  dit_cfg_size: 2
-  dit_ulysses_size: 2
+  cfg_size: 2
+  ulysses_size: 2
 compilation_config:
   resolutions: [[480, 832], [720, 1280]]
   num_frames: [33, 81]
@@ -1405,7 +1394,7 @@ extra_model_config:
   text_encoder_fsdp_size: 4
 ```
 
-### 14.11 Decision rationale (one-line per choice; cross-ref to design sections)
+### 13.11 Decision rationale (one-line per choice; cross-ref to design sections)
 
 | Choice | Why | See |
 | --- | --- | --- |
@@ -1413,16 +1402,72 @@ extra_model_config:
 | Cross-cutting concerns stay typed sub-configs | Universal precedent; Pydantic gives validation + IDE completion for free | §5 Axis B → B2 |
 | `_config`-suffix naming | Matches `LlmArgs` (`kv_cache_config`, `cuda_graph_config`, `quant_config`, ...) | §3.2 Takeaway 5; §7.5 |
 | `CompilationConfig` as flat umbrella | Single discoverable surface; avoids three-hop `args.compilation_config.torch_compile_config.X` | §8.1 |
-| Sub-configs under `tensorrt_llm.visual_gen.*`, not top-level | Mirrors LLM's `tensorrt_llm.llmapi.*` pattern; eliminates same-name collisions | §14.1, §14.2 |
+| Sub-configs under `tensorrt_llm.visual_gen.*`, not top-level | Mirrors LLM's `tensorrt_llm.llmapi.*` pattern; eliminates same-name collisions | §13.1, §13.2 |
 | Strict unknown-key handling on `extra_model_config` | Safety net for typos in lieu of IDE completion | §9.3 |
 | `Field(status="prototype")` on every new field | Reuses LLM-side marker; full snapshot harness deferred | §10 |
 | No alias/deprecation shims | Pre-GA refactor; direct edits | §10.2, §13.2 |
 | `TLLM_VG_*` env-var prefix | Shorter than `TLLM_VISUALGEN_*`; matches `TLLM_*` brevity convention | §11 |
 | `skip_warmup` → `compilation_config`; `skip_components` → env var; `enable_layerwise_nvtx_marker` → top-level flat | Placement matches actual usage (compile-adjacent / test-only / LLM-mirror) | §11.1 |
 | `--visual_gen_args` CLI primary name | Matches `VisualGenArgs` class name | §12.4 |
-| `QuantConfig` reused from `tensorrt_llm.llmapi` | Same Pydantic class object on both sides; one source of truth for quant defaults | §14.1 |
-| `CacheConfig` stays a discriminated union | Already correctly designed today; preserved verbatim | §14.7 |
+| `QuantConfig` reused from `tensorrt_llm.llmapi` | Same Pydantic class object on both sides; one source of truth for quant defaults | §13.1 |
+| `CacheConfig` stays a discriminated union | Already correctly designed today; preserved verbatim | §13.7 |
 | `dtype`, `device`, `pipeline.fuse_qkv`, three offload fields deleted | Verified unwired or hardcoded at `e527a9f785` | §2.2.5, §7.6 |
+
+---
+
+## 14. Migration Plan
+
+### 14.1 Sequencing
+
+The refactor breaks into independent phases. Each is mergeable on its own and testable in isolation. **No backwards-compatibility shims** — direct edits, users update their YAMLs.
+
+**Phase 1 — Move `VisualGenArgs` and sub-configs to `tensorrt_llm/visual_gen/args.py`.** No structural change yet. Just move out of `_torch/visual_gen/config.py` per M2 §3.1 / §9 Option C. Keep re-exports from the old location for one release (only to avoid breaking internal imports). Adopt `Field(status="prototype")` on all fields.
+
+**Phase 2 — Rename to `_config` suffix.** Rename `compilation → compilation_config`, `parallel → parallel_config`, `attention → attention_config`, `cache → cache_config`, `torch_compile → (folded into compilation_config)`, `cuda_graph → (folded into compilation_config)`. `quant_config` already has the suffix. Direct rename; users update YAMLs.
+
+**Phase 3 — Fold `torch_compile` and `cuda_graph` into `compilation_config`.** Both become flat prefixed fields on `CompilationConfig` (`cuda_graph_batch_sizes`, `torch_compile_enable_inductor`, etc.). Update consumers in `PipelineLoader`.
+
+**Phase 4 — Delete dead-code fields.**
+
+- `dtype` (overridden to bf16 by `DiffusionModelConfig.torch_dtype`).
+- `device` (LLM has no analogue; we're CUDA-only).
+- `pipeline.fuse_qkv` (no production reader).
+- `pipeline.enable_offloading`, `pipeline.offload_device`, `pipeline.offload_param_pin_memory` (zero consumers).
+
+These four field removals are independent; can be done together or split. `PipelineConfig` is empty after the offload / fuse_qkv removals and disappears.
+
+**Phase 5 — Internal-state cleanup.** Move `dynamic_weight_quant`, `force_dynamic_quantization` to `PrivateAttr`.
+
+**Phase 6 — Move test/debug knobs.**
+
+- `skip_warmup` → `compilation_config.skip_warmup`.
+- `skip_components` → env var `TLLM_VG_SKIP_COMP`; update the test fixtures.
+- `pipeline.enable_layerwise_nvtx_marker` → top-level flat `VisualGenArgs.enable_layerwise_nvtx_marker`.
+
+**Phase 7 — Introduce the model registry.** Add `tensorrt_llm/_torch/visual_gen/registry.py` with `register_model(hf_id, ModelEntry)`. Populate entries for all currently-supported HF model IDs (Wan T2V/I2V variants, Flux variants, LTX-Video variants), with their pipeline classes and empty-or-populated `defaults` dicts.
+
+**Phase 8 — Add `extra_model_config: dict[str, Any]` to `VisualGenArgs`.** Update `PipelineLoader` to look up the registry entry by `args.model`, validate unknown keys against `entry.defaults`, merge, and pass the merged dict to `entry.pipeline_cls(...)`.
+
+**Phase 9 — Move per-arch fields into registry defaults.**
+
+- LTX-2 paths (`text_encoder_path`, `spatial_upsampler_path`, `distilled_lora_path`) → defaults for LTX-2 HF IDs.
+- `parallel.refiner_dit_*` (7 fields) → defaults for LTX-2 two-stage HF IDs.
+- `parallel.t5_fsdp_size` → defaults for Wan HF IDs.
+
+Delete the corresponding fields from `VisualGenArgs` / `ParallelConfig` in the same PR.
+
+**Phase 10 — Add the discovery API.** `VisualGen.supported_models()` + `VisualGen.extra_model_config(hf_id)` classmethods.
+
+**Phase 11 — Update CLI.** Add `--visual_gen_args` as primary in `commands/serve.py` and `bench/benchmark/visual_gen.py`; keep `--extra_visual_gen_options` as alias.
+
+### 14.2 What we *don't* do for compat
+
+- No `validation_alias` / `AliasChoices` for renames.
+- No `Field(deprecated=...)` markers for removed fields.
+- No soft-removal warning window.
+- No backwards-compat YAML parsing for old field names.
+
+VisualGen is pre-GA. The migration is a clean break.
 
 ---
 
@@ -1514,5 +1559,6 @@ extra_model_config:
 | 9  | 2026-05-08 | Codex — strict convergence final-check pass | 0       | 0        | 0    | 0        |
 | 10 | 2026-05-11 | Owner (Zhenhua) — reversed direction on §6 (dict pass-through over typed discriminated union); restored `_config` suffix to match `LlmArgs`; folded `torch_compile` / `cuda_graph` flat into `compilation_config`; dropped `dtype`/`device`/offload/`fuse_qkv` as dead code; `TLLM_VG_*` env-var prefix; `skip_warmup` → `compilation_config`, `skip_components` → env var; dropped alias / deprecation shims; `--visual_gen_args` CLI primary | 23      | 23       | 0    | 0        |
 | 11 | 2026-05-11 | Owner (Zhenhua) — API-clarity pass: merged "recommendation" duplication (§1 short version + §14 list) into one consolidated **§14 Final Design — Public API** with complete class listings, namespace map, end-to-end example, decision-rationale table; added §14.2 collision analysis vs `LlmArgs` (resolved by folding `CudaGraphConfig`/`TorchCompileConfig` into `CompilationConfig` and namespacing sub-configs under `tensorrt_llm.visual_gen.*`) | 2       | 2        | 0    | 0        |
+| 12 | 2026-05-12 | PR #9 review round 1 — Owner (Zhenhua) feedback on the open PR: swap §13 ↔ §14 so Final Design (API) reads before Migration; correct top-level export list (verified against `origin/main`: drop `VisualGen*Error`, add `VisualGenMetrics`/`VisualGenOutput`/`ExtraParamSchema`); drop public `PipelineComponent` export (env-var-only); re-export `QuantConfig` from `tensorrt_llm.visual_gen`; move two derived quant flags off `VisualGenArgs` into the internal `DiffusionModelConfig`; drop redundant `dit_` prefix on `ParallelConfig` fields; document YAML load/dump idiom (`yaml.safe_load` + `VisualGenArgs(**dict)` + `args.model_dump(exclude_none=True)`). | 9       | 6        | 3    | 0        |
 
-**Converged on 2026-05-11 after iteration 11** — the design's direction was substantively redirected by owner review iteration 10 after 9 Codex iterations had converged on a typed-discriminated-union model; iteration 11 added the full public-API surface as a single consolidated section, eliminating recommendation-duplication and making the namespace + collision story explicit. Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; iterations 10-11 (owner review) raised 25 issues all of which were resolved. Severity decreased monotonically across the Codex iterations (high → medium → none); the owner-review iterations were a directional pivot + API-clarity follow-up. The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11.
+**Converged on 2026-05-11 after iteration 11; round 1 of PR review feedback applied 2026-05-12 (6 resolved, 3 open — 1 acknowledgment-only thread the owner may still want to push back on; 2 awaiting decisions on HF-id-vs-`_class_name` mapping and on adding `from_yaml`/`to_yaml` classmethods).** Codex iterations 1-9 surfaced 30 thread-substantive issues all of which were resolved; owner-review iterations 10-11 raised 25 issues (all resolved) as a directional pivot + API-clarity follow-up; PR round 1 (this round) raised 9 (6 resolved, 3 awaiting owner direction). Severity decreased monotonically across the Codex iterations (high → medium → none). The doc's inline Codex/Claude review threads were stripped on finalize; this Iteration Tracker is the audit trail. Per-iteration commit history: `102e3df08a` (initial draft + Codex iter 1) → `09116d6604` (Codex iter 2) → `02e847c5a7` (Codex iter 3) → `d074c003bd` (Codex iter 4) → `a2b76d26cc` (Codex iter 5) → `b581b2ad0d` (Codex iter 6) → `6f152f7d3c` (Codex iter 7) → `a59ce5b2d9` (Codex iter 8) → `f469b20436` (Codex iter 9 strip + finalize) → owner-review iterations 10-11 → PR round 1.
