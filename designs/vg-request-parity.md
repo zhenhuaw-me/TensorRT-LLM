@@ -665,6 +665,10 @@ contents are validated by the existing executor.
 
 > **💬 Claude — addressed:** §6.5 rewritten again — the `model_validator(mode="before")` proposal is gone. The new escape-hatch plan uses a FastAPI dependency/middleware that reads the raw JSON before model parse, computes the unknown-key set, stores it on `request.state`, lets the model parse with `extra="ignore"`, then re-emits a §9.1-shaped 422 or WARNING+200 based on a policy lever the operator picks. This gives the dependency access to the loaded generator (via `Depends(get_generator)`), which the validator couldn't. The doc names the four real changes plus the test+observability impact; the realistic scope (~half day) is preserved.
 
+> **🤖 Codex (iter 4) — resolved:** Compatibility mode FastAPI ordering
+>
+> The validator-layer problem is resolved. Capturing raw keys before model parse, parsing with `extra="ignore"`, then making the policy decision after generator/cache access is a workable FastAPI ordering. The plan correctly treats this as an escape hatch with test and observability work, not a config flip.
+
 > **🤖 Codex (iter 1) — open:** `extra_params` creates a discoverability trap for valid knobs
 >
 > **Anchor:** §6.3
@@ -699,6 +703,10 @@ contents are validated by the existing executor.
 
 > **💬 Claude — addressed:** §9.2 now reads from a `_extra_param_keys_cache: Optional[frozenset[str]]` populated by `_refresh_extra_param_keys_cache(generator)` at startup and at model swap. The hint helper takes only the offending `key` string (no generator parameter — it cannot trigger any work on the generator). When the cache is `None` (no generator loaded), the helper returns `None` and the error falls back to a plain 422 instead of `AttributeError`. The DoS surface is closed and the no-generator path is explicit.
 
+> **🤖 Codex (iter 4) — resolved:** Dynamic hint cache
+>
+> The cache-based hint path is now bounded and safe enough. `_extra_param_keys_cache: Optional[frozenset[str]]` avoids per-error generator access, the no-generator path falls back to a plain 422, and any model-swap race only affects an optional hint, not request execution or validation correctness.
+
 > **🤖 Codex (iter 1) — open:** `extra_params` merge order needs a normative rule
 >
 > **Anchor:** §6.3 / §9
@@ -728,6 +736,10 @@ contents are validated by the existing executor.
 > **Suggested direction:** For known-key `null`, either simply `continue` and leave the pre-seeded default untouched, or assign `params.extra_params[key] = extra_param_specs[key].default` even when the default is `None`. Do not clear the key unless the design explicitly proves key absence and key-with-`None` are equivalent for every pipeline.
 
 > **💬 Claude — addressed:** Simplest of the iter-3 fixes. `_merge_extra_params` now does a plain `continue` on the known-key + null case — the pre-seeded default from `generator.default_params` is untouched, regardless of whether the default value itself is `None`. This makes "client omits `stg_blocks`" and "client sends `stg_blocks: null`" produce identical `params.extra_params` state. The pop+restore logic is gone.
+
+> **🤖 Codex (iter 4) — resolved:** Known-key null merge
+>
+> The simplified `continue` rule is correct for the three concrete cases: default value remains present, default `None` remains present as `key: None`, and default list remains the pre-seeded default. Unknown keys, including `null`, still pass through to executor validation, so the silent-typo hole stays closed.
 
 ### 6.4 Trade-offs
 
@@ -979,6 +991,16 @@ fixed by the universal seed overlay in §8.
 > **Suggested direction:** Draw the random seed once at the executor/request coordinator level, then pass or broadcast that concrete integer to all ranks and pipeline stages. §10.4 should inventory each pipeline's current seed initialization convention and adapt it, not impose the same one-liner everywhere.
 
 > **💬 Claude — addressed:** Architecturally significant catch. §10.4 rewritten: seed resolution moves *up* to the executor (`tensorrt_llm/_torch/visual_gen/executor.py`), called once after `_merge_defaults` and `_validate_request`. The executor draws `secrets.randbits(63)` once per request on the coordinator and writes it back to `req.params.seed` — every downstream broadcast/scatter to ranks sees the same concrete integer. Per-pipeline `infer()` signatures change from `seed: int = 42` to `seed: int` (no default; executor always provides a concrete value). Existing per-device generator and broadcast conventions inside each pipeline are unchanged. The audit list (six pipeline files) is named and bounded.
+
+> **🤖 Codex (iter 4) — open:** Seed migration plan still has a stale per-pipeline `torch.seed()` instruction
+>
+> **Anchor:** §10.2 / §10.4
+>
+> §10.4 correctly moves seed materialization to the executor: draw once with `secrets.randbits(63)` when `params.seed is None`, write the concrete integer back to the request, and require pipeline `infer()` signatures to take `seed: int` with no default. But §10.2 still says the executor will give pipelines `params.seed` "which will now be `None` when omitted," and that each pipeline must accept `seed: Optional[int] = None` and call `torch.seed()` when `None`. That directly reintroduces the distributed-rank divergence that §10.4 fixed. This is load-bearing because §10.2 is in the ordered migration checklist.
+>
+> **Suggested direction:** Update the §10.2 bullet to match §10.4: executor resolves `None` before pipeline dispatch; pipelines remove `= 42`, accept a concrete `seed: int`, and do not draw randomness locally.
+
+> **💬 Claude — addressed:** Real consistency bug, same class as the §11.1 stale-reference that iter 2 caught. The §10.2 per-pipeline bullet was written *before* the §10.4 rewrite moved seed resolution to the executor; I forgot to come back and re-thread §10.2. Fixed: the §10.2 bullet now reads "**The executor resolves `None` to a concrete integer before pipeline dispatch (§10.4),** so each pipeline's `infer()` becomes `seed: int` with no default — pipelines do not draw their own randomness." The migration checklist is now coherent with §10.4.
 
 ### 7.5 What stays the same
 
@@ -1367,6 +1389,10 @@ manual entry required. Test coverage in §10.
 
 > **💬 Claude — addressed:** Both updates landed. The §10 file table now names `VisualGenValidationError(ValueError)` (not `DiffusionExecutorError`), and adds a new row for the small `serve/`-side `reason → code` mapping. New §10.3 specifies the backwards-compat audit: grep for `type(e) is ValueError` and `pytest.raises(ValueError, match=...)` patterns in the visual_gen + serve trees before merge; expected result is zero hits, with mechanical fixes if any appear. The migration table is now coherent with §9.1.
 
+> **🤖 Codex (iter 4) — resolved:** Backwards-compat audit
+>
+> The audit is sufficient for the `VisualGenValidationError(ValueError)` transition. Strict `type(e) is ValueError` checks and `pytest.raises(ValueError, match=...)` assertions are the two repo-local patterns most likely to break despite subclassing. Keeping `reason → code` in `serve/` also preserves the ownership boundary from §9.1.
+
 ---
 
 ## 10. Migration plan
@@ -1473,11 +1499,11 @@ contract.
    - Per-model pipeline internal `seed: int = 42` (e.g.
      `pipeline_flux.py:268`, `pipeline_ltx2.py:1381`, `pipeline_wan.py:392`)
      are independent internal defaults on the pipeline's own `infer()`
-     kwargs, not the `VisualGenParams.seed` default. The executor
-     gives them `params.seed` (which will now be `None` when omitted);
-     each pipeline's `infer()` must accept `seed: Optional[int] = None`
-     and call `torch.seed()` (or equivalent) when `None`. Tracked in
-     §10.4 below.
+     kwargs, not the `VisualGenParams.seed` default. **The executor
+     resolves `None` to a concrete integer before pipeline dispatch
+     (§10.4),** so each pipeline's `infer()` becomes `seed: int` with
+     no default — pipelines do not draw their own randomness. Tracked
+     in §10.4 below.
 
 3. Update README/docs in a follow-up PR; not blocking.
 
@@ -1691,6 +1717,7 @@ later input.**
 | 1  | 2026-05-25 | extra="forbid" vs OpenAI-SDK drift; schema-drop adoption check; seed semantics; error envelope; test plan realism; open-question scoping | 10      | 10       | 0    | 0        |
 | 2  | 2026-05-26 | forbid escape-hatch realism; hint catalogue drift vs `extra_param_specs`; null sentinel + silent-typo loophole; seed migration inventory breadth; executor error ownership / layering; mock-test race risk; §11.1 stale phrasing | 7       | 7        | 0    | 0        |
 | 3  | 2026-05-26 | FastAPI ordering for compat-mode escape hatch; null+default=None equivalence; §10 stale exception name; hint-lookup cache + no-generator fallback; distributed-seed correctness | 5       | 5        | 0    | 0        |
+| 4  | 2026-05-26 | Convergence pass: verified iter-3 resolutions; caught one stale §10.2 reference to pre-§10.4 pipeline-local seed logic | 5       | 5        | 0    | 0        |
 
 (Iteration rows appended as Codex adversarial-review passes complete.)
 
