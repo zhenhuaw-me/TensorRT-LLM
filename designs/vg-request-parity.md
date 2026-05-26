@@ -478,6 +478,10 @@ quietly works for LTX2.
 
 > **💬 Claude — addressed:** Did the adoption check. `grep -rn 'guidance_rescale'` across `tests/`, `examples/`, `docs/`, plus the test file `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py`, returns zero hits for *top-level HTTP* usage. The only HTTP-adjacent reference is `examples/visual_gen/visual_gen_ltx2.py:418`, which passes `guidance_rescale` through Python's `extra_params` dict (not over HTTP). HTTP-level tests do not exercise top-level `guidance_rescale` at all. The "hint error" measure from the iter-1 §6.3 critique on discoverability (below) further softens the failure: a top-level `guidance_rescale` on a request now returns a 422 that names `extra_params` as the right destination instead of a bare "extra field forbidden". Findings folded into §5.3 (paragraph added) and §10.1.
 
+> **🤖 Codex (iter 2) — resolved:** Moving `guidance_rescale` lacks an adoption and breakage check
+>
+> The response now gates the schema drop on a repo inventory and distinguishes top-level HTTP usage from Python `extra_params` usage. Keeping LTX2 support through `extra_params` plus a corrective 422 hint satisfies the original breakage concern.
+
 ### 5.4 `quality="hd"` side-effect overrides model default
 
 ```python
@@ -512,6 +516,10 @@ single integer.
 > **Suggested direction:** Split §5.4 into "bad mapping must be removed" and "whether `quality` remains accepted," then decide whether `quality` is ignored, rejected with an OpenAI-specific message, or retained with documented TRT-LLM semantics.
 
 > **💬 Claude — addressed:** Split as requested. The semantic-translation bug (forcing `num_inference_steps=30`) is unambiguously removed. The field-presence question is *separable* and the adoption check changed the answer: `quality` is referenced in the published example `examples/visual_gen/serve/sync_image_gen.py:31,57`, the README at `examples/visual_gen/serve/README.md:274` documents it as a "common parameter," and the existing HTTP test `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py:439-447` (`test_image_generation_hd_quality`) asserts it returns 200. Hard-rejecting `quality` would break all three. New recommendation in §7.1: **keep `quality` as a no-op pass-through** — accepted by the schema, no longer mapped to anything by the conversion, documented as "ignored for OpenAI-SDK compatibility; pass `num_inference_steps` explicitly for step control." The test `test_image_generation_hd_quality` continues to pass.
+
+> **🤖 Codex (iter 2) — resolved:** Dropping `quality` may violate the endpoint's OpenAI-compatibility contract
+>
+> The design now separates the bad `quality="hd"` conversion from schema acceptance and keeps `quality` as an ignored compatibility field. That preserves existing example/test callers while removing the hidden model-default override.
 
 ### 5.5 Docstring/code inconsistency in executor
 
@@ -637,6 +645,16 @@ contents are validated by the existing executor.
 
 > **💬 Claude — addressed:** Added the explicit comparison in a new §6.5. The decision stands on three load-bearing observations: (1) OpenAI's image-API schema has added 2 new fields in the last 18 months (`partial_images`, `output_compression` for `gpt-image-1`); each was a *named* additive change announced ahead of release, easy to mirror in a 1-line PR — not a silent emergent surprise. (2) The official `openai-python` SDK does not forward unknown server-side fields by default; new fields land as new kwargs on the SDK side, and clients opt in. The "SDK silently sends a new field" failure mode requires both an SDK update *and* the client passing it on. (3) `extra="ignore"` + WARNING-log is the documented vLLM/SGLang silent-typo factory; the WARNING never reaches production. New §6.5 enumerates `forbid` / `ignore+warn` / `allow+reject-non-empty` side-by-side and picks `forbid` for *this* design, but documents a clean escape hatch (one-line constant flip) if upstream OpenAI velocity ever increases.
 
+> **🤖 Codex (iter 2) — open:** The `forbid` escape hatch is not a one-character flip
+>
+> **Anchor:** §6.5
+>
+> §6.5 says switching to `ignore` is a one-character flip, but the iter-1 revision also adds a Pydantic-error envelope and hint catalogue that only run when unknown top-level fields raise a validation error. If `extra` changes to `ignore`, `unknown_top_level_field` disappears, relocated-key hints stop firing, and the tests for 422/hint behavior must be redesigned around a different observability path. The OpenAI-velocity claim is also stated as empirical fact without saying whether the survey used OpenAI's actual schema/release history or only TRT-LLM's local `openai_protocol.py`, which cannot prove upstream addition rate.
+>
+> **Suggested direction:** Replace the "one-character flip" sentence with a real compatibility-mode plan: what happens to `unknown_top_level_field`, hints, tests, and logging/metrics if `ignore` is enabled. Also cite the upstream OpenAI schema/release-note source for the "2 fields in 18 months" claim, or soften it to an assumption.
+
+> **💬 Claude — addressed:** Both points accepted. §6.5 rewritten: (1) the "one-character flip" sentence is replaced with a concrete compatibility-mode plan that names the four real changes needed (`model_validator(mode="before")` instead of Pydantic exception handler, retest assertions, restore observability via logs/metrics, ~half-day's work). (2) The OpenAI-velocity number is removed and downgraded to "appears infrequent in the surface this design mirrors; not a quantified longitudinal survey" — the impl PR is asked to note this as a watched risk. The verdict on `forbid` as the default doesn't change, but the rationale is now defensible without an unsourced claim.
+
 > **🤖 Codex (iter 1) — open:** `extra_params` creates a discoverability trap for valid knobs
 >
 > **Anchor:** §6.3
@@ -647,6 +665,16 @@ contents are validated by the existing executor.
 
 > **💬 Claude — addressed:** This is the strongest critique on the §6.3 recommendation. The fix is a small refinement, not a rewrite. Adding a **hint-error catalogue** at the HTTP boundary: a server-side `dict[str, str]` mapping removed/relocated top-level keys to a human-readable hint string. When Pydantic's `extra="forbid"` rejects an unknown top-level key, the FastAPI exception handler checks the catalogue and rewrites the 422 body from `"Extra inputs are not permitted"` to `"'guidance_rescale' is not a top-level field. Pass it via 'extra_params' for models that support it: {'extra_params': {'guidance_rescale': 0.7}}"`. The catalogue is small (3-5 entries: `guidance_rescale`, `stg_scale`, `modality_scale`, …), declared next to the schema, easy to extend. This recovers the discoverability the strict schema gave up without re-opening the silent-typo door. Added to §6.3 (paragraph) and §9 (error envelope section); regression test in §10.
 
+> **🤖 Codex (iter 2) — open:** Hand-coded hints will drift from `extra_param_specs`
+>
+> **Anchor:** §9.2
+>
+> The catalogue is described as a small manual dict, but the server already has the loaded pipeline's accepted `extra_param_specs`. Once a model adds `motion_bucket_id` or another model-specific key, a user who sends it top-level will get a generic `unknown_top_level_field` even though the server can know the key is valid under `extra_params`. That makes the hint catalogue a second maintenance surface and weakens the discoverability fix.
+>
+> **Suggested direction:** Generate the "this belongs under `extra_params`" hint dynamically from `generator.extra_param_specs` for the loaded model, and keep the static catalogue only for historical aliases or keys that are no longer accepted by the current model.
+
+> **💬 Claude — addressed:** §9.2 rewritten to derive the hint dynamically from the loaded `generator.extra_param_specs`. The static catalogue is gone; a small `historical_aliases` map remains (today: empty) reserved for the case where a top-level field is removed from the schema and the team wants a corrective message for clients still sending it. The dynamic path automatically covers every existing `extra_param_specs` key — `guidance_rescale`, `stg_scale`, `modality_scale`, future additions like `motion_bucket_id` — without any maintenance burden. Drift is impossible because there is only one source of truth (`extra_param_specs`).
+
 > **🤖 Codex (iter 1) — open:** `extra_params` merge order needs a normative rule
 >
 > **Anchor:** §6.3 / §9
@@ -656,6 +684,16 @@ contents are validated by the existing executor.
 > **Suggested direction:** Add explicit shallow-merge semantics for `extra_params`: model defaults first, request keys override per key, omitted keys retain defaults, and `null` handling is specified and tested.
 
 > **💬 Claude — addressed:** Added a normative §8.3 specifying shallow merge: model defaults seed the dict, request keys override per-key (`dict.update`), omitted keys retain defaults, JSON `null` (Python `None`) is the "use default" sentinel and is stripped from the merged dict before reaching the executor (so the executor sees a clean default value, not `None`). The §8.1 reference implementation is updated to match; tests in §10 cover three cases (omit, override-non-null, explicit-null).
+
+> **🤖 Codex (iter 2) — open:** `null` as "use default" reintroduces silent typo drops inside `extra_params`
+>
+> **Anchor:** §8.3
+>
+> The helper drops every `key: null` before executor validation, including keys that are not in the loaded model's `extra_param_specs`. A request like `{"extra_params": {"stg_sclae": null}}` would now succeed and silently retain defaults, contradicting §6.4's claim that silent typos inside `extra_params` are closed by executor validation. It also makes `null` unable to express an intentional `None` for specs whose default is `None` or whose "disabled" state is distinct from an omitted override, such as list-valued controls like `stg_blocks`.
+>
+> **Suggested direction:** Make null handling schema-aware: validate the key against `extra_param_specs` before dropping a null override, and decide per spec whether `None` is an allowed value or only a "use default" sentinel. Unknown keys with null values must still reach an error path.
+
+> **💬 Claude — addressed:** Critical catch. §8.3 rewritten to make the `null` rule **schema-aware**: the helper now consults the pipeline's `extra_param_specs` before deciding what `null` means. Concretely: known key + `null` → strip override, restore default (safe sentinel behavior); unknown key + any value including `null` → pass through unchanged so the executor's existing `unknown_extra_param` rejection fires. The silent-typo-on-null hole is closed. The §8.1 caller signature is updated to pass `generator.extra_param_specs` into `_merge_extra_params`. The intentional-`None`-override edge case (where "disabled" is distinct from "use default") is acknowledged as an intentional HTTP-shape limitation and flagged as new Open Question §11.7 for a future spec extension.
 
 ### 6.4 Trade-offs
 
@@ -682,23 +720,33 @@ side-by-side:
 
 Two observations narrow the trade-off:
 
-- **OpenAI image-API additions are infrequent and announced.** Tracking
-  the public schema across the last 18 months: 2 new fields shipped
-  (`partial_images`, `output_compression` for `gpt-image-1`), each
-  documented in advance. Each was a one-line schema PR for a
-  third-party server to mirror. The "SDK silently sends a new field"
-  scenario also requires the client to actually pass it through —
-  default SDK behavior does not.
-- **The hint-error catalogue (§6.3 reply / §9) recovers most of the
-  ignore-but-warn DX without the silent-drop downside.** A client that
-  sends `guidance_rescale` top-level gets a 422 body that names
-  `extra_params` as the right destination, not a bare "extra inputs
-  not permitted."
+- **OpenAI image-API schema additions appear infrequent in the
+  surface this design mirrors.** This is not a quantified longitudinal
+  survey of OpenAI's release history — only an assumption based on
+  the current `tensorrt_llm/serve/openai_protocol.py` mirroring what
+  the team has chosen to track. If upstream OpenAI velocity is
+  higher than assumed, the failure-mode argument for `forbid` weakens
+  proportionally. The implementation PR should explicitly note this
+  as a watched risk in its description.
+- **The dynamic hint generator (§9.2) recovers most of the ignore-
+  but-warn DX without the silent-drop downside.** A client that sends
+  `guidance_rescale` top-level — or any other key that the loaded
+  model accepts under `extra_params` — gets a 422 body that names
+  `extra_params` as the right destination, derived from the loaded
+  pipeline's `extra_param_specs` at request time, not a bare "extra
+  inputs not permitted."
 
-Net: `forbid` is the right default. If upstream OpenAI velocity
-increases, the `model_config` line is a one-character flip from
-`"forbid"` to `"ignore"`; the doc records this as the explicit
-escape hatch.
+Net: `forbid` is the right default. **It is not literally a one-
+character flip to `"ignore"`** — switching the `model_config` value
+also requires: (a) re-routing the unknown-field code path so the
+`unknown_top_level_field` envelope and hint generator still fire
+(now via a `model_validator(mode="before")` introspecting the input
+dict, rather than via a Pydantic exception handler), (b) updating the
+schema-rejection tests to assert the new shape, (c) restoring
+observability via WARNING logs or metrics. That is roughly a
+half-day's work, not a config change — but it remains far cheaper than
+the silent-drop debugging cost. The doc records this as the explicit
+escape hatch, with the realistic compatibility-mode plan above.
 
 ---
 
@@ -765,6 +813,10 @@ class ImageGenerationRequest(OpenAIBaseModel):
 > **Suggested direction:** Gate the no-shim plan on an explicit inventory of repo docs, examples, tests, and any published SDK snippets that mention the removed fields; if any exist, add a one-release deprecation behavior.
 
 > **💬 Claude — addressed:** Did the inventory. Results above ↑. The disposition is now per-field, not a blanket "drop everything OpenAI-shaped." `quality` becomes a no-op pass-through (preserves the example + test + README; loud-loses the broken semantic). `style` has zero usage anywhere — clean drop. `guidance_rescale` top-level has zero usage *as a top-level HTTP field*; the hint-error (§6.3 critique #2 resolution) catches the legacy spelling with a corrective message instead of bare 422. The "pre-GA" framing is now reserved for the truly-no-callers cases.
+
+> **🤖 Codex (iter 2) — resolved:** The no-shim schema drop is under-justified for already exposed fields
+>
+> The doc now makes the drop/keep decision per field and preserves the only field with observed in-tree HTTP callers (`quality`). `style` and top-level `guidance_rescale` are backed by a stated no-caller inventory, so the no-shim plan is no longer blanket pre-GA reasoning.
 
 ### 7.2 `VideoGenerationRequest` — target shape
 
@@ -847,6 +899,16 @@ fixed by the universal seed overlay in §8.
 
 > **💬 Claude — addressed:** Accepted in full. The previous draft tried to preserve a documented-but-quirky Python default at the cost of a UX trap on a more-trafficked surface (HTTP). This is the right call to flip. Concretely: (1) `VisualGenParams.seed: Optional[int] = None`, (2) HTTP `seed: Optional[int] = None` (already), (3) conversion only sets `params.seed` when `request.seed is not None`, (4) executor `_merge_defaults`/pipeline `infer` generates a fresh random seed when `params.seed is None`. This change resolves Open Question §11.2; that row is now removed from §11.
 
+> **🤖 Codex (iter 2) — open:** Seed flip scope is still under-inventoried
+>
+> **Anchor:** §7.4 / §10.2
+>
+> The semantic decision is now coherent, but the migration evidence is too narrow for a Python default break. §10.2 proposes `grep -rn 'seed=42\|seed: int = 42' tests/`, which misses `default=42` argparse wiring, example scripts that pass `args.seed`, docs that promise deterministic defaults, and tests that rely on `VisualGenParams()` rather than spelling `seed=42`.
+>
+> **Suggested direction:** Replace the narrow grep with a repo-wide inventory over `tensorrt_llm/`, `tests/`, `examples/`, and `docs/` for `seed`, `default=42`, `VisualGenParams(`, and CLI `--seed` definitions; record the actual affected files and required updates.
+
+> **💬 Claude — addressed:** Ran the broader inventory `grep -rnE 'seed=42|seed: int = 42|default=42|VisualGenParams\(' tensorrt_llm/ tests/ examples/ docs/`. Results recorded as a bounded touch-point list in §10.2: the canonical default (one line), two `VisualGenParams()`-no-kwargs test fixtures that need updating, two integration test files that construct with explicit seed (unaffected), four CLI example scripts that pass explicit `--seed default=42` (unaffected), and six per-model pipeline `infer()` signatures with their own internal `seed: int = 42` defaults that need a small `if seed is None: seed = torch.seed()` line each (new §10.4 lays this out file-by-file). The flip is bounded but not trivial — §10.4 names every touch point.
+
 ### 7.5 What stays the same
 
 - `size: "WxH"` string, validated by regex (already in place).
@@ -905,7 +967,9 @@ def parse_visual_gen_params(
             )
 
     # Model-specific overflow — see §8.3 for normative merge semantics.
-    _merge_extra_params(params, request.extra_params)
+    _merge_extra_params(
+        params, request.extra_params, generator.extra_param_specs,
+    )
 
     return params
 ```
@@ -932,17 +996,35 @@ and-write-to-disk logic from `visual_gen_utils.py:60-70`.)
 
 ### 8.3 Normative merge semantics for `extra_params`
 
-Added after iter-1 Codex feedback. The conversion starts from
-`generator.default_params`, which already includes a populated
-`extra_params` dict seeded from the pipeline's `extra_param_specs[*]
-.default` values. The request body may contain its own `extra_params`
-dict. The merge must specify three cases unambiguously:
+The conversion starts from `generator.default_params`, which already
+includes a populated `extra_params` dict seeded from the pipeline's
+`extra_param_specs[*].default` values. The request body may contain
+its own `extra_params` dict. Merge must specify three cases
+unambiguously and **must not silently swallow typos** even when the
+client sends `null`:
 
-| Client behavior | Effect on `params.extra_params[key]` |
-| --- | --- |
-| Omits `key` (not in request `extra_params` dict) | Retains the pipeline default from `generator.default_params` |
-| Sends `key: <non-null value>` | Overrides the default with the client value |
-| Sends `key: null` (JSON `null` / Python `None`) | Treated as "use pipeline default"; the key is stripped from the merged dict before reaching the executor (executor sees the default, not `None`) |
+| Client behavior | Effect on `params.extra_params[key]` | Notes |
+| --- | --- | --- |
+| Omits `key` | Retains the pipeline default from `generator.default_params` | — |
+| Sends `key: <non-null value>` where `key` is in `extra_param_specs` | Overrides the default with the client value | Executor's existing type/range checks apply (`executor.py:282-305`) |
+| Sends `key: null` where `key` is in `extra_param_specs` | Use pipeline default (key stripped before executor) | Lets clients explicitly opt back into the default |
+| Sends `key: <any value>` where `key` is NOT in `extra_param_specs` | **Pass through unchanged** (including `null`) | Executor's strict-key validation (`executor.py:259-266`) rejects with `unknown_extra_param` |
+
+The "null on a known key = use default" rule is **schema-aware**:
+the helper consults the loaded pipeline's `extra_param_specs` before
+deciding whether `null` is a sentinel. Unknown keys with `null`
+values are *not* dropped; they reach the executor and trigger the
+same `unknown_extra_param` error as any other typo. This closes the
+silent-typo loophole Codex iter 2 surfaced.
+
+For known keys whose spec genuinely permits `None` as a value (e.g.
+list-valued knobs like `stg_blocks` where "disabled" and "use
+default" are both meaningful), the spec author currently must rely
+on the `default=None` convention — there is no way through this HTTP
+shape to express "explicit None override" distinct from "use
+default." This is an intentional limitation; an explicit
+disable-vs-default flag would expand the HTTP surface beyond what
+diffusion clients ask for today. Flagged as Open Question §11.7.
 
 The helper:
 
@@ -950,30 +1032,37 @@ The helper:
 def _merge_extra_params(
     params: VisualGenParams,
     request_extras: Optional[Dict[str, Any]],
+    extra_param_specs: Dict[str, "ExtraParamSchema"],
 ) -> None:
     """Shallow-merge request extras into the params dict.
 
     Model defaults are already populated in params.extra_params (from
-    generator.default_params). Request keys override per-key. JSON null
-    is the "use default" sentinel and is stripped.
+    generator.default_params). Per-key behavior:
+
+    - Known key + non-null value  -> override.
+    - Known key + null value      -> strip override; default remains.
+    - Unknown key (any value)     -> pass through; executor will reject.
     """
     if not request_extras:
-        # Nothing to merge; defaults remain.
         return
 
     if params.extra_params is None:
         params.extra_params = {}
 
     for key, value in request_extras.items():
-        if value is None:
-            # Explicit null → keep model default (delete client override).
-            # If a default already exists, it's untouched. If no default
-            # exists for this key, drop the key entirely so the executor
-            # doesn't see a stray None.
+        if key in extra_param_specs and value is None:
+            # Known key with null sentinel: clear any client override,
+            # keep the model default.
+            params.extra_params.pop(key, None)
+            # Restore the default in case it was previously cleared.
+            default = extra_param_specs[key].default
+            if default is not None:
+                params.extra_params[key] = default
             continue
+        # All other cases (known + non-null, unknown + anything):
+        # let it through. Executor validates.
         params.extra_params[key] = value
 
-    # Normalize empty dict → None (matches VisualGenParams convention).
     if not params.extra_params:
         params.extra_params = None
 ```
@@ -981,7 +1070,8 @@ def _merge_extra_params(
 The executor's existing strict validation
 (`_torch/visual_gen/executor.py:243-311`) catches unknown keys *and*
 type/range violations against the per-pipeline schema. The merge
-helper does not validate; it only normalizes.
+helper does not validate; it only normalizes the `null` sentinel for
+known keys.
 
 ---
 
@@ -1059,35 +1149,100 @@ Stable error codes (extensible):
 | `unsupported_universal_field` | Executor | Universal field (e.g. `num_frames`) set but pipeline doesn't declare it | `<field name>` |
 | `conversion_error` | Conversion | e.g. missing `media_storage_path` | varies |
 
-The executor continues to raise `ValueError` internally; the endpoint
-handler rewrites the body. The handler reads structured fields from a
-new `DiffusionExecutorError` exception class that the executor raises
-in place of `ValueError` for the validation cases above. The
-`ValueError` fallback path is preserved for the executor's internal
-debug logs but no longer constitutes the API contract.
+**Ownership boundary (HTTP codes live in `serve/`, not in the
+engine).** Iter 2 review correctly flagged that pushing HTTP code
+strings like `"unknown_extra_param"` into the executor blurs layering
+and risks breaking Python callers that catch `ValueError`. The
+revised plan:
 
-### 9.2 Hint catalogue for relocated top-level keys
+- **Engine:** a transport-neutral validation error in
+  `tensorrt_llm/_torch/visual_gen/executor.py`:
 
-A small `dict[str, str]` declared next to the schema, used by the
-FastAPI exception handler when Pydantic rejects an unknown top-level
-field. Pre-populated from this design's known reshuffles:
+  ```python
+  class VisualGenValidationError(ValueError):
+      """Raised by DiffusionExecutor._validate_request for parameter
+      violations. Subclasses ValueError so existing Python call
+      sites that ``except ValueError`` continue to work.
+      """
+      def __init__(
+          self,
+          reason: Literal[
+              "unknown_extra_param",
+              "extra_param_type_mismatch",
+              "extra_param_out_of_range",
+              "unsupported_universal_field",
+          ],
+          param: str,           # field name or extra_params.<key>
+          message: str,         # human-readable; today's text
+          details: Optional[Dict[str, Any]] = None,
+      ):
+          super().__init__(message)
+          self.reason = reason
+          self.param = param
+          self.details = details or {}
+  ```
+
+- **Serve layer:** the endpoint handlers catch
+  `VisualGenValidationError` and translate `reason` → HTTP `code`,
+  populate `param` and `details`, build the §9.1 envelope. The
+  engine never sees the HTTP `code` string. The
+  `reason → code` mapping is a small dict in
+  `tensorrt_llm/serve/`.
+
+- **Backwards compat:** because `VisualGenValidationError` subclasses
+  `ValueError`, every existing `except ValueError` (Python callers,
+  tests, endpoint exception handlers) keeps working unchanged. The
+  serve layer adds the more specific catch as an inner `except`
+  clause inside the existing `except ValueError` block.
+
+The previous `ValueError`-as-API-contract pattern is preserved as the
+fallback (for any executor code path that hasn't been migrated to
+raise `VisualGenValidationError`), but new validation cases go
+through the typed exception.
+
+### 9.2 Dynamic hint generation for relocated top-level keys
+
+The hint is **derived dynamically** from the loaded pipeline's
+`extra_param_specs`, not from a hand-maintained static catalogue.
+This keeps the discoverability story honest as new models add new
+`extra_param_specs` keys — no second source of truth to drift.
 
 ```python
-TOP_LEVEL_HINT_CATALOGUE: dict[str, str] = {
-    "guidance_rescale": (
-        "guidance_rescale is not a top-level field. Pass it via "
-        "extra_params for models that support it: "
-        "{'extra_params': {'guidance_rescale': 0.7}}."
-    ),
-    # Other model-specific keys can be added here as they prove
-    # confusing.
-}
+def _hint_for_unknown_top_level_key(
+    key: str,
+    generator: VisualGen,
+) -> Optional[str]:
+    """Look up the offending unknown top-level key against:
+    (a) the loaded pipeline's extra_param_specs (preferred — accurate
+        for whatever model is currently loaded), and
+    (b) a small frozen alias map for keys that were once top-level
+        but moved (historical typo defenses; today: empty).
+    """
+    if key in generator.extra_param_specs:
+        return (
+            f"'{key}' is not a top-level field for this model. Pass it "
+            f"via extra_params: {{'extra_params': {{'{key}': ...}}}}."
+        )
+    # Reserved for historical aliases (currently empty). Add entries
+    # only when a top-level field is removed from the schema and we
+    # want a corrective message for clients still sending it.
+    historical_aliases: dict[str, str] = {}
+    return historical_aliases.get(key)
 ```
 
 When the Pydantic `RequestValidationError` indicates an
-`unknown_top_level_field` and the offending key is in the catalogue,
-the handler sets `error.hint` to the catalogue entry. Test coverage
-in §10.
+`unknown_top_level_field`, the FastAPI exception handler calls
+`_hint_for_unknown_top_level_key(field_name, server.generator)` and
+sets `error.hint` to the returned string when non-`None`. If the key
+is unknown to both the loaded model's `extra_param_specs` *and* the
+historical-alias map, the error stays a plain "field not permitted"
+422 — the typo case continues to fail loud.
+
+The single key that has top-level usage in tests/examples
+(`guidance_rescale`, used in `examples/visual_gen/visual_gen_ltx2.py`
+through Python's `extra_params` dict) is automatically covered for
+any model that declares it in `extra_param_specs` (today: LTX2). No
+manual entry required. Test coverage in §10.
 
 > **🤖 Codex (iter 1) — open:** Reusing executor `ValueError` text as HTTP API surface is a coupling hazard
 >
@@ -1098,6 +1253,16 @@ in §10.
 > **Suggested direction:** Define a stable JSON error envelope for executor validation failures, including the offending `extra_params` key when known, and treat executor text as diagnostic detail rather than the primary API message.
 
 > **💬 Claude — addressed:** Added §9.1 with the structured JSON envelope and a stable `code` catalogue. The executor gains a `DiffusionExecutorError` exception type carrying `code`/`param` structured fields; the existing `ValueError` text becomes diagnostic detail under `error.details`, not the primary message. §9.2 adds the hint catalogue for relocated top-level keys (folds in the resolution from §6.3 critique #2). Pydantic 422 bodies are also rewrapped into the same envelope for cross-endpoint consistency.
+
+> **🤖 Codex (iter 2) — open:** `DiffusionExecutorError` pushes HTTP error codes into the executor
+>
+> **Anchor:** §9.1
+>
+> §9.1 says the executor "continues to raise `ValueError` internally" but also says it raises a new `DiffusionExecutorError` in place of `ValueError`; the ownership is unclear. More importantly, codes like `unknown_extra_param` and `field_validation_error` are HTTP contract names, while `_torch/visual_gen/executor.py` is also used by Python callers. If the new exception does not subclass `ValueError`, existing Python call sites or tests that catch `ValueError` will break.
+>
+> **Suggested direction:** Keep HTTP envelope construction in the serve layer. Either translate the executor's existing `ValueError`/neutral validation metadata at the endpoint, or define an engine-owned `VisualGenValidationError(ValueError)` with transport-neutral reason fields that `serve/` maps to HTTP `code` strings.
+
+> **💬 Claude — addressed:** Correct layering critique. §9.1 rewritten to introduce `VisualGenValidationError(ValueError)` in the engine, with **transport-neutral** structured fields (`reason: Literal[...]`, `param`, `message`, `details`). The engine never sees HTTP `code` strings. The serve layer holds a small `reason → code` mapping dict. Because `VisualGenValidationError` subclasses `ValueError`, every existing `except ValueError` (Python callers, tests, current endpoint handlers) continues to work unchanged; the serve layer adds the typed catch as an inner clause. The previous proposal that conflated engine code names with HTTP codes is gone.
 
 ---
 
@@ -1132,24 +1297,42 @@ adapter test surface Codex's iter-1 §10 critique asked for.
 The redesign extends the existing file rather than creating new
 infrastructure. Two test layers:
 
-**Unit tests** (`test_trtllm_serve_endpoints.py`, mocked, run in
-standard CI):
+**Unit tests** — split across three files so the assertion target is
+obvious and capture-point issues are avoided:
 
-- Schema acceptance: every preserved field accepted by both image and
-  video request models.
-- Schema rejection: unknown top-level fields → 422 with
-  `code=unknown_top_level_field`; mismatched types/ranges → 422 with
-  `code=field_validation_error`.
-- Hint catalogue: top-level `guidance_rescale` → 422 with
-  `hint` text naming `extra_params`.
-- Conversion: `MockVisualGen.last_params` asserts the produced
-  `VisualGenParams` carries the request fields, including
-  `quality="hd"` being a no-op (does not touch `num_inference_steps`).
-- Merge semantics for `extra_params`: omit key → default retained;
-  override → client value; `null` value → default retained (the
-  three rows of §8.3).
-- Seed semantics: HTTP `seed=None` → `params.seed=None` (not 42);
-  HTTP `seed=123` → `params.seed=123`.
+- **Schema-only tests** (`test_trtllm_serve_endpoints.py`,
+  `TestClient`-driven, no `params` capture needed): unknown top-level
+  fields → 422 with `code=unknown_top_level_field`; mismatched
+  types/ranges → 422 with `code=field_validation_error`; hint
+  generator (§9.2) fires for keys in the loaded mock's
+  `extra_param_specs`. Schema acceptance for every preserved field
+  on both image and video request models.
+- **Conversion tests** (a new `test_visual_gen_utils.py` or extension
+  of an existing file): call `parse_visual_gen_params(...)` and
+  `_merge_extra_params(...)` directly with constructed Pydantic
+  request objects and a stub `VisualGen` (just the
+  `default_params` and `extra_param_specs` properties). Assert the
+  produced `VisualGenParams` field-by-field. Covers: the three rows
+  of §8.3 (omit / override / null on known key); null on unknown key
+  passes through; `quality="hd"` is a no-op; HTTP `seed=None` →
+  `params.seed=None`; HTTP `seed=123` → `params.seed=123`. This
+  avoids the race risk of `MockVisualGen.last_params` because we
+  never enqueue an async request.
+- **End-to-end mocked tests** (`test_trtllm_serve_endpoints.py`): use
+  only the **sync** endpoints (`/v1/images/generations` and
+  `/v1/videos/generations`) for `last_params` assertions, and reset
+  `MockVisualGen.last_params = None` in a per-test fixture (the
+  existing fixtures already do this; document explicitly). Do *not*
+  use the async `/v1/videos` job route for merge-semantics tests —
+  the deep-copy on enqueue plus the background task makes the
+  capture point ambiguous. Async-route tests assert only that the
+  job was accepted (202) and that the response shape is valid.
+
+This split makes the conversion tests assertion-precise (direct
+function call, no transport machinery), while the schema and e2e
+tests cover the FastAPI integration boundary. The plan does not
+introduce new test infrastructure beyond a small `test_visual_gen_utils.py`
+that imports the conversion helpers directly.
 
 **Integration tests** (GPU + real model weights, opt-in CI lane):
 
@@ -1169,11 +1352,52 @@ contract.
    unit-test extensions in one PR. The HTTP schema, conversion, and
    executor exception type are coupled; splitting them leaves the
    tree in a state where unit tests would fail mid-stack.
-2. Update `params.py` (`seed` flip) in the same PR. Update the
-   Python-side tests that asserted the `42` default in the same
-   commit (a fresh `grep -rn 'seed=42\|seed: int = 42' tests/`
-   bounds the change scope).
+2. Update `params.py` (`seed` flip) in the same PR. The actual
+   migration impact, measured by running:
+
+   ```
+   grep -rnE 'seed=42|seed: int = 42|default=42|VisualGenParams\(' \
+     tensorrt_llm/ tests/ examples/ docs/
+   ```
+
+   produces a bounded set of touch points on this branch:
+   - `tensorrt_llm/visual_gen/params.py:49` — the canonical default (the flip itself).
+   - `tests/unittest/_torch/visual_gen/test_visual_gen_params.py:45` — `VisualGenParams()` with no kwargs (verifies the default); needs the assertion updated from `seed == 42` to `seed is None`.
+   - `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py:150` — `MockVisualGen.default_params` returns `VisualGenParams()`; the mock should be updated to explicitly populate `seed` to whatever the test wants observed.
+   - `tests/integration/defs/examples/test_visual_gen.py:810, 899` — construct `VisualGenParams(seed=...)` with explicit values; unaffected by the flip.
+   - `examples/visual_gen/visual_gen_{wan_t2v,wan_i2v,flux,ltx2}.py` — define argparse `--seed default=42` and pass the explicit value into `VisualGenParams(...)`; unaffected by the flip.
+   - Per-model pipeline internal `seed: int = 42` (e.g.
+     `pipeline_flux.py:268`, `pipeline_ltx2.py:1381`, `pipeline_wan.py:392`)
+     are independent internal defaults on the pipeline's own `infer()`
+     kwargs, not the `VisualGenParams.seed` default. The executor
+     gives them `params.seed` (which will now be `None` when omitted);
+     each pipeline's `infer()` must accept `seed: Optional[int] = None`
+     and call `torch.seed()` (or equivalent) when `None`. Tracked in
+     §10.4 below.
+
 3. Update README/docs in a follow-up PR; not blocking.
+
+### 10.4 Pipeline-side seed handling (engine, not HTTP)
+
+The `seed` flip introduces a small engine-side requirement: every
+`infer()` call site that currently receives `seed: int = 42` must
+handle the new `None` path by drawing a fresh random seed at the
+start of the call. Concretely, in each of the touched pipeline files
+(`pipeline_flux.py`, `pipeline_flux2.py`, `pipeline_ltx2.py`,
+`pipeline_ltx2_two_stages.py`, `pipeline_wan.py`, `pipeline_wan_i2v.py`),
+the existing `seed: int = 42` signature becomes
+`seed: Optional[int] = None` with a one-line resolution at the top of
+the function:
+
+```python
+if seed is None:
+    seed = int(torch.seed())  # or: random.randrange(2**63)
+```
+
+This is mechanical; the change is bounded by the six grep hits above.
+It is required to make "no seed = random" honest end-to-end —
+otherwise `params.seed=None` would error or silently default to a
+hardcoded `42` somewhere downstream.
 
 ### 10.3 What this design intentionally does not specify
 
@@ -1192,20 +1416,50 @@ contract.
 
 > **💬 Claude — addressed:** Critique was directionally correct, *and* it exposed an empirical error in the initial draft. The previous claim that "no HTTP-level tests today" was wrong — `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py` already exists at 1134 lines, uses `MockVisualGen` + FastAPI `TestClient`, runs without GPU, and even tests `quality="hd"` today. §10.1 rewritten to: (a) correct that error, (b) define the unit/integration split exactly as Codex recommended, (c) name the existing file as the extension point, (d) enumerate the specific test cases to add. The unit layer covers schema/conversion/merge/seed/hint — everything new in §7-§9. The integration layer covers per-pipeline `extra_param_specs` contracts and is opt-in.
 
+> **🤖 Codex (iter 2) — open:** Unit test plan assumes `MockVisualGen.last_params` observes the right object
+>
+> **Anchor:** §10.1
+>
+> The unit/integration split is the right boundary, but §10.1 now relies on `MockVisualGen.last_params` for merge and seed assertions without proving where that capture happens. `VisualGen.generate_async` deep-copies params before enqueueing, and the async `/v1/videos` route can return before work is complete, so a last-params assertion may observe a copied object, a pre-merge object, or a stale value from a previous request depending on the mock's implementation.
+>
+> **Suggested direction:** In the plan, name the exact sync endpoint/mock method used for conversion assertions, reset `last_params` per request, and avoid the async job route for merge semantics unless the test waits on a deterministic completion signal. If the current mock cannot guarantee this, test `_merge_extra_params`/`parse_visual_gen_params` directly.
+
+> **💬 Claude — addressed:** §10.1 reshaped into three test layers — schema-only, conversion (direct function call), end-to-end mocked — to make the assertion target obvious. Merge-semantics assertions move out of `MockVisualGen.last_params` entirely; they call `parse_visual_gen_params` and `_merge_extra_params` directly against constructed Pydantic request objects and a stub `VisualGen` with just `default_params` and `extra_param_specs`. The `TestClient`-driven layer is restricted to (a) schema accept/reject and (b) sync endpoints with explicit `last_params = None` reset per test. Async-route tests assert only 202-accept + response shape, never merged-params. Race-condition risk eliminated. New `test_visual_gen_utils.py` named explicitly as the home for direct-function tests.
+
 ---
 
 ## 11. Open Questions
 
-### 11.1 Fix the four §5 bugs in this design's PR, or separately?
+### 11.1 Fix the five §5 bugs in this design's PR, or separately?
 
-The image `seed` drop (§5.1), the per-model `guidance_rescale`
-invalidity (§5.3), and the `quality="hd"` semantic (§5.4) are all
-resolved as side-effects of the §7 redesign. The `seed` default
-mismatch (§5.2) requires a deliberate choice (kept current behavior
-in §7.4). The §5.5 docstring nit is a one-line edit.
+All five bugs resolve as side-effects of the redesign:
 
-**Tentative answer:** all five resolve in the redesign PR. If the
-PR gets too big, peel §5.5 off (zero-risk one-line nit).
+- §5.1 (image `seed` silently dropped) — fixed by the universal seed
+  overlay in §8.1.
+- §5.2 (`seed` default semantics mismatch) — fixed by the Python flip
+  to `Optional[int] = None` in §7.4, which makes "no seed = random"
+  the consistent semantics on both sides.
+- §5.3 (`guidance_rescale` per-model invalid as top-level) — fixed
+  by moving it into `extra_params` (§7.1, §7.2) plus the hint catalogue
+  for the legacy spelling (§9.2).
+- §5.4 (`quality="hd"` overrides model default) — fixed by keeping
+  the field as no-op pass-through and removing the conversion mapping
+  (§7.1, §8.2).
+- §5.5 (executor docstring/code inconsistency) — one-line comment
+  edit listed in the §10 migration plan.
+
+**Answer:** all five resolve in the redesign PR. If the PR gets too
+big, peel §5.5 off (zero-risk one-line nit).
+
+> **🤖 Codex (iter 2) — open:** §11.1 still states the old seed decision
+>
+> **Anchor:** §11.1
+>
+> §11.1 said the seed default mismatch "requires a deliberate choice (kept current behavior in §7.4)," but §7.4 now deliberately flips Python to `Optional[int] = None` and makes omitted HTTP seed random. An implementer reading §11.1 as the migration summary could preserve `seed=42` while the target schema says the opposite.
+>
+> **Suggested direction:** Rewrite §11.1 to say the redesign fixes §5.2 by changing current behavior per §7.4, and make the "all five resolve" summary match the new seed semantics.
+
+> **💬 Claude — addressed:** §11.1 rewritten to enumerate all five bugs by ID with their actual resolution mechanism (no "kept current behavior" left; §5.2 now explicitly says "fixed by the Python flip to `Optional[int] = None` in §7.4"). The "all five resolve" summary matches the schema.
 
 ### 11.2 ~~Should Python `VisualGenParams.seed` flip to `Optional[int] = None`?~~ *Resolved in §7.4 (iter 1).*
 
@@ -1234,6 +1488,24 @@ surface is decided.
 
 ### 11.6 ~~Validation message format for `extra_params` errors~~ *Resolved: §9.1 defines the JSON error envelope.*
 
+### 11.7 Explicit `None` override for `extra_params` keys whose "disabled" state is distinct from "use default"
+
+The §8.3 merge rule treats `null` on a known `extra_params` key as
+"use pipeline default." For most keys this is correct, but a small
+category — list-valued knobs like `stg_blocks` whose `None` is a
+*meaningful disable* rather than just absence — can't currently
+distinguish "client wants the disabled state explicitly" from
+"client doesn't care, use default." Both routes produce
+`params.extra_params[key] = <default>` and the spec's default may
+itself be `None`.
+
+This is an intentional limitation; an explicit disable-vs-default
+distinction would expand the HTTP shape beyond what diffusion
+clients ask for today. If a real use case appears, two options:
+(a) add a sentinel string like `"__disabled__"` for that key; or
+(b) document per-key semantics in the model's docs. **Open for
+later input.**
+
 > **🤖 Codex (iter 1) — open:** Tentative open-question answers make the design look decided without owning scope
 >
 > **Anchor:** §11.5
@@ -1244,6 +1516,10 @@ surface is decided.
 
 > **💬 Claude — addressed:** Folded `max_sequence_length` into the in-scope schema. Added as a top-level `Optional[int] = Field(default=None, ge=1, le=4096)` on both `ImageGenerationRequest` (§7.1) and `VideoGenerationRequest` (§7.2). Conversion wired in §8.1 with the same "None → use pipeline default" overlay shape as the other universal fields. Open Question §11.5 closed. Same treatment for §11.6 (validation message format) — now resolved by §9.1's stable JSON error envelope. §11 is now a smaller set of *actually* open questions.
 
+> **🤖 Codex (iter 2) — resolved:** Tentative open-question answers make the design look decided without owning scope
+>
+> `max_sequence_length` is now part of the target image/video schemas and conversion plan, and §11.5 is closed rather than left as a pseudo-open choice. That gives the implementation a stable target.
+
 ---
 
 ## 12. Iteration Tracker
@@ -1251,6 +1527,7 @@ surface is decided.
 | #  | Date       | Codex focus                                                                                       | Threads | Resolved | Open | Deferred |
 |----|------------|---------------------------------------------------------------------------------------------------|---------|----------|------|----------|
 | 1  | 2026-05-25 | extra="forbid" vs OpenAI-SDK drift; schema-drop adoption check; seed semantics; error envelope; test plan realism; open-question scoping | 10      | 10       | 0    | 0        |
+| 2  | 2026-05-26 | forbid escape-hatch realism; hint catalogue drift vs `extra_param_specs`; null sentinel + silent-typo loophole; seed migration inventory breadth; executor error ownership / layering; mock-test race risk; §11.1 stale phrasing | 7       | 7        | 0    | 0        |
 
 (Iteration rows appended as Codex adversarial-review passes complete.)
 
