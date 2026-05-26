@@ -199,8 +199,8 @@ The class is decorated `@set_api_status("prototype")` (line 22).
 | `frame_rate` | `Optional[float]` | `None` | Video only |
 | `negative_prompt` | `Optional[str]` | `None` | |
 | `image` | `Optional[Union[str, bytes, List[Union[str, bytes]]]]` | `None` | Reference image(s) — path or raw bytes |
-| `mask` | `Optional[Union[str, bytes, List[bytes]]]` | `None` | Inpainting mask |
-| `image_cond_strength` | `Optional[float]` | `None` | |
+| `mask` | `Optional[Union[str, bytes, List[bytes]]]` | `None` | Dead code on this branch — defined but no pipeline reads it (see §11.4). This design drops it. |
+| `image_cond_strength` | `Optional[float]` | `None` | I2V/I2I conditioning strength |
 | `num_images_per_prompt` | `int` | `1` | Non-optional |
 | `extra_params` | `Optional[Dict[str, Any]]` | `None` | Model-specific overflow; keys discovered via `VisualGen.extra_param_specs` |
 
@@ -364,8 +364,7 @@ Symbols: ✅ present, ❌ absent, ⚠️ present-with-divergence, ⤵️ promote
 | `frame_rate` | n/a | ⚠️ via `fps: int` | Type divergence (HTTP `int`; Python `float`) |
 | `negative_prompt` | ✅ | ✅ | — |
 | `image` | n/a (image edits OOS) | ⚠️ via `input_reference` (base64 / UploadFile) | Transport difference is intentional |
-| `mask` | n/a | ❌ | Video inpainting not exposed via HTTP |
-| `image_cond_strength` | n/a | ❌ | Absent; Wan I2V declares it in default params |
+| `image_cond_strength` | n/a | ❌ | Absent today; design adds it to `VideoGenerationRequest` (§7.2) |
 | `num_images_per_prompt` | ⚠️ via `n: int (1..10)` | ⚠️ via `n: int (1..4)` | Constraint divergence (Python uncapped) |
 | `extra_params` | ❌ | ❌ | No HTTP path to send model-specific keys other than the hardcoded `guidance_rescale` (§5.3, §6) |
 
@@ -393,9 +392,10 @@ Symbols: ✅ present, ❌ absent, ⚠️ present-with-divergence, ⤵️ promote
 
 ## 5. Bugs surfaced by the gap analysis
 
-These are concrete defects in the current `tensorrt_llm/serve/` code. They
-are not the central design question but the design must decide whether to
-fix them here or in a follow-up PR (see Open Question §11.1).
+These are concrete defects in the current `tensorrt_llm/serve/` code.
+Each is described as "why it's wrong" and "how this design fixes
+it" — they are fixed in the redesign, not deferred. Resolution
+mechanism for each is in the corresponding §7-§10 section.
 
 ### 5.1 Image `seed` is silently dropped
 
@@ -492,13 +492,17 @@ shouldn't be `quality → steps`; it should be `quality → "the model's
 high-quality preset"`, which is per-model and not modelable as a
 single integer.
 
-### 5.5 Docstring/code inconsistency in executor
+### 5.5 Executor docstring contradicts its own code
 
-`tensorrt_llm/_torch/visual_gen/executor.py:71-86` comments above
-`_GENERATION_CONFIG_FIELDS` say "the value will be silently ignored",
-but `_validate_request` actually **raises** when one of those fields is
-set but not declared by the pipeline (lines 273-280, 307-311). Minor
-nit; flagging for the impl PR.
+`tensorrt_llm/_torch/visual_gen/executor.py:71-86` documents
+`_GENERATION_CONFIG_FIELDS` as fields that "will be silently
+ignored" when set but not declared by the pipeline. The code at
+`_validate_request` (lines 273-280, 307-311) actually **raises**
+`ValueError` in that case. The docstring is wrong, not the code —
+the strict-rejection behavior is correct (it makes typos surface
+loud) and is what the rest of this design depends on. **Fix: update
+the docstring to match the code** ("raises `ValueError` when set
+but not declared"). One-line edit, listed in §10.
 
 ---
 
@@ -521,7 +525,8 @@ shape that fits the no-silent-typo constraint.
 - **Pattern A — Open `dict[str, Any]` at top level.** SGLang's native
   `/generate` endpoint takes `sampling_params: Dict | List[Dict]`
   (sglang `python/sglang/srt/managers/io_struct.py`). Zero schema
-  friction, zero validation, no IDE help.
+  friction, zero validation, no OpenAPI documentation of accepted
+  keys.
 - **Pattern B — Open dict in a typed envelope.** vLLM's `vllm_xargs`
   (`vllm/entrypoints/openai/chat_completion/protocol.py`); vLLM-Omni's
   `lora` (`vllm_omni/entrypoints/openai/protocol/images.py`); SGLang
@@ -624,7 +629,7 @@ Three options side-by-side:
 
 | Option | Unknown top-level key behavior | Caller experience | Production failure mode |
 | --- | --- | --- | --- |
-| **`extra="forbid"`** *(this design)* | 422 with structured Pydantic error; hint generator may rewrite the message for known-relocated keys (§9.2) | "field rejected" surfaces immediately in any environment; one-line fix to send through `extra_params` | If upstream OpenAI ships a new field the server hasn't mirrored, well-shaped requests start failing at validation until trtllm-serve catches up. Loud, traceable, easy to triage. |
+| **`extra="forbid"`** *(this design)* | 422 with the Pydantic error message naming the rejected field | "field rejected" surfaces immediately in any environment; one-line fix to send through `extra_params` | If upstream OpenAI ships a new field the server hasn't mirrored, well-shaped requests start failing at validation until trtllm-serve catches up. Loud, traceable, easy to triage. |
 | **`extra="ignore"` + WARNING log** | Server silently drops unknown fields; logs them at WARNING | Looks like success; the dropped knob has no observable effect on output until the user notices wrong colors / wrong step count / etc. | Warning logs are filtered by most production aggregators by default; "field doesn't work" tickets accumulate at the support tier, not the schema tier. This is vLLM's documented failure mode (Issues #7337, #11153). |
 | **`extra="allow"`** | Unknown keys are accepted and stored on the model; conversion ignores them | Same caller experience as `ignore`; even less server-side visibility | Same as `ignore` plus: any downstream code that loops over `request.model_dump()` may forward typo'd keys deeper into the stack. |
 
@@ -638,13 +643,13 @@ Two observations narrow the trade-off:
   higher than assumed, the failure-mode argument for `forbid` weakens
   proportionally. The implementation PR should explicitly note this
   as a watched risk in its description.
-- **The dynamic hint generator (§9.2) recovers most of the ignore-
-  but-warn DX without the silent-drop downside.** A client that sends
-  `guidance_rescale` top-level — or any other key that the loaded
-  model accepts under `extra_params` — gets a 422 body that names
-  `extra_params` as the right destination, derived from the loaded
-  pipeline's `extra_param_specs` at request time, not a bare "extra
-  inputs not permitted."
+- **The schema documents `extra_params` as the destination for
+  model-specific keys.** The `extra_params` field's `description`
+  string (rendered in the OpenAPI spec) names it as the per-model
+  overflow surface, so a developer who reads the schema for any
+  reason — including the 422 body that points at the rejected
+  field — has a documented path to follow without a server-side
+  hint helper.
 
 Net: `forbid` is the right default. **It is not literally a one-
 character flip to `"ignore"`** — switching the `model_config` value
@@ -660,11 +665,10 @@ plan, named here so future maintainers don't underestimate the cost:
    set on `request.state` and lets the model parse with
    `extra="ignore"`.
 2. **Re-emit the §9.1 envelope or a deliberate warning** based on
-   `request.state.unknown_top_level_keys` and the §9.2 cache. The
-   choice — 422 (parity with `forbid`) vs. WARNING log + 200 (true
-   ignore) vs. metric counter — is a policy lever the escape-hatch
-   user picks based on the upstream-velocity scenario they're
-   handling.
+   `request.state.unknown_top_level_keys`. The choice — 422 (parity
+   with `forbid`) vs. WARNING log + 200 (true ignore) vs. metric
+   counter — is a policy lever the escape-hatch user picks based on
+   the upstream-velocity scenario they're handling.
 3. **Update the schema-rejection tests** to assert the new shape:
    `unknown_top_level_field` no longer comes from
    `RequestValidationError`; tests instead inspect the warning log
@@ -685,78 +689,67 @@ escape hatch — the impl PR can leave it as a comment in
 
 ## 7. Target HTTP request schemas
 
+### 7.0 General rule — Python is the source of truth for defaults
+
+Every HTTP request field on the visual_gen endpoints defaults to
+`Optional[T] = None`. The conversion layer only sets `params.*` when
+the client explicitly sent a non-`None` value. Whatever default the
+client "ends up with" is whatever `VisualGenParams` declares — either
+the field's explicit Python default, or the pipeline default that
+`generator.default_params` populates for fields whose Python value is
+`None`. **The HTTP layer never invents a default value.**
+
+This rule has two consequences worth stating up front so the rest of
+the doc stays consistent:
+
+1. **`null` at the top-level HTTP field is indistinguishable from
+   "field omitted" post-parse.** Pydantic v2 by default produces
+   `request.field is None` for both `{"field": null}` and `{}`. The
+   conversion treats both as "do not override," so both fall through
+   to the Python default. There is no separate "client opted into
+   pipeline default" path at this layer because the layer cannot tell
+   the two forms apart.
+
+2. **`null` inside `extra_params` is a real, distinguishable value.**
+   The dict carries the distinction: `{"extra_params": {"stg_blocks":
+   null}}` has the key present with value `None`; `{"extra_params": {}}`
+   has no key. §8.3 handles this layer explicitly — known key + null
+   means "use the pipeline default that `generator.default_params`
+   already populated"; unknown key + any value (including null) passes
+   through to the executor's `unknown_extra_param` rejection.
+
+Both layers agree on the principle: **the conversion never overrides
+with `None`**, and the Python default is what runs whenever the client
+doesn't explicitly send a real value. The HTTP schema does not carry
+numeric ranges (`ge=`, `le=`) for fields where the Python side has
+no equivalent validator — inventing a constraint on HTTP that Python
+doesn't enforce creates a second source of truth that drifts. The
+only HTTP-side validators that stay are format guards Python can't
+express at the type level (e.g. the `"WxH"` regex on `size`).
+
 ### 7.1 `ImageGenerationRequest` — target shape
 
 ```python
 class ImageGenerationRequest(OpenAIBaseModel):
-    # OpenAI-standard
+    # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
-    model: Optional[str] = None
-    n: int = Field(default=1, ge=1, le=10)
-    size: Optional[str] = Field(default="auto", pattern=r"^(\d+x\d+|auto)$")
     response_format: Literal["url", "b64_json"] = "url"
-    output_format: Literal["png", "webp", "jpeg"] = "png"
-    user: Optional[str] = None
-    seed: Optional[int] = None              # §7.4 — semantics fixed
-
-    # OpenAI-shaped, no-op pass-through (compat only)
-    quality: Literal["standard", "hd"] = Field(
-        default="standard",
-        description=(
-            "Accepted for OpenAI-SDK compatibility; ignored by TRT-LLM. "
-            "Pass `num_inference_steps` for explicit step control."
-        ),
-    )
-
-    # TRT-LLM extensions (top-level, "well-known")
-    num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
-    guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
-    max_sequence_length: Optional[int] = Field(default=None, ge=1, le=4096)
-    negative_prompt: Optional[str] = None
-
-    # Model-specific overflow
-    extra_params: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Model-specific parameters forwarded to the underlying pipeline. "
-            "See per-model docs for accepted keys. Unknown keys are rejected "
-            "by the executor with a hint naming the supported keys for the "
-            "loaded model."
-        ),
-    )
-
-    # Removed: `style` (no callers in tree).
-    # Removed: top-level `guidance_rescale` (moves into `extra_params`).
-```
-
-**Schema disposition for fields with broken or absent semantics:**
-
-| Field | Adoption evidence | Disposition |
-| --- | --- | --- |
-| `quality` | `examples/visual_gen/serve/sync_image_gen.py:31,57`; `examples/visual_gen/serve/README.md:274`; `test_image_generation_hd_quality` test | **Keep schema field, drop conversion behavior.** Accepted as a no-op for OpenAI-SDK compatibility. Schema docstring says: "Accepted for OpenAI compatibility; ignored by TRT-LLM. Pass `num_inference_steps` for explicit step control." |
-| `style` | No reference in `tests/`, `examples/`, or `docs/` (grep confirmed) | **Drop.** Zero callers; remove cleanly. |
-| `guidance_rescale` (top-level) | No top-level HTTP usage in `tests/`, `examples/`, or `docs/`; only Python-side `extra_params` dict access in `examples/visual_gen/visual_gen_ltx2.py:418` | **Drop top-level; available via `extra_params` for LTX2 callers.** Hint-error from §6.3 catches the legacy top-level spelling. |
-
-### 7.2 `VideoGenerationRequest` — target shape
-
-```python
-class VideoGenerationRequest(OpenAIBaseModel):
-    # OpenAI-standard
-    prompt: str
-    model: Optional[str] = None
-    input_reference: Optional[Union[str, UploadFile]] = None
-    n: int = Field(default=1, ge=1, le=4)
-    size: Optional[str] = Field(default="auto", pattern=r"^(\d+x\d+|auto)$")
-    seconds: float = Field(default=2.0, ge=1.0, le=16.0)
-    fps: int = Field(default=24, ge=8, le=60)
-    output_format: Literal["mp4", "avi", "auto"] = "auto"
+    output_format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = "png"
     seed: Optional[int] = None
 
-    # TRT-LLM extensions (top-level, "well-known")
-    num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
-    guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
-    max_sequence_length: Optional[int] = Field(default=None, ge=1, le=4096)
+    # Resolution. `size` is OpenAI-shaped "WxH" string. width+height are an
+    # equivalent structured alternative; if both width and height are sent,
+    # they override `size`. Sending exactly one of {width, height} is an error.
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+    # TRT-LLM-supported per-request params (1:1 with VisualGenParams fields)
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    max_sequence_length: Optional[int] = None
     negative_prompt: Optional[str] = None
+    n: Optional[int] = None     # maps to VisualGenParams.num_images_per_prompt
 
     # Model-specific overflow
     extra_params: Optional[Dict[str, Any]] = Field(
@@ -767,8 +760,85 @@ class VideoGenerationRequest(OpenAIBaseModel):
         ),
     )
 
-    # Removed: top-level `guidance_rescale` (moves into `extra_params`).
+    # Accepted-but-ignored OpenAI-shaped fields. Conversion no-ops; if the
+    # client sends a value the server logs a WARNING. Kept in the schema so
+    # OpenAI-SDK clients don't trip `extra="forbid"`.
+    model: Optional[str] = None              # trtllm-serve is single-model
+    quality: Optional[Literal["standard", "hd"]] = None
+    style: Optional[Literal["vivid", "natural"]] = None
+    user: Optional[str] = None
 ```
+
+**Schema disposition for OpenAI-shaped fields that have no TRT-LLM
+semantic:**
+
+| Field | Adoption evidence | Disposition |
+| --- | --- | --- |
+| `quality` | `examples/visual_gen/serve/sync_image_gen.py:31,57`; `examples/visual_gen/serve/README.md:274`; `test_image_generation_hd_quality` test | **Accept + warn-on-set.** Schema keeps the field so OpenAI-SDK callers pass `extra="forbid"`; conversion no-ops and logs WARNING when the client sends a value. The previous `quality="hd" → num_inference_steps=30` mapping is removed. |
+| `style` | No reference in `tests/`, `examples/`, or `docs/` (grep confirmed) | **Accept + warn-on-set.** Same treatment as `quality` — consistent OpenAI-compat surface even though no callers exist today. |
+| `model` | Used by OpenAI SDK clients to select a model. trtllm-serve is single-model per process. | **Accept + warn-on-set when value mismatches loaded model.** Conversion compares `request.model` against the loaded model id; logs WARNING on mismatch but does not reject. |
+| `user` | No callers; OpenAI-shaped trace field. | **Accept + ignore silently.** No semantic for TRT-LLM; passing through gives OpenAI-SDK clients a no-fail path with no log noise. |
+| `guidance_rescale` (top-level) | No top-level HTTP usage in `tests/`, `examples/`, or `docs/`; only Python-side `extra_params` dict access in `examples/visual_gen/visual_gen_ltx2.py:418` | **Drop top-level; available via `extra_params` for LTX2 callers.** Clients sending top-level `guidance_rescale` get a plain `extra="forbid"` 422. |
+
+### 7.2 `VideoGenerationRequest` — target shape
+
+```python
+class VideoGenerationRequest(OpenAIBaseModel):
+    # Prompt + transport
+    prompt: str
+    response_format: Literal["url", "b64_json"] = "url"
+    output_format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = "auto"
+    seed: Optional[int] = None
+    input_reference: Optional[Union[str, UploadFile]] = None
+
+    # Resolution
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+    # Frame budget. num_frames is preferred; if absent, the engine
+    # derives it from seconds * frame_rate. Sending num_frames overrides
+    # the derivation. frame_rate is the canonical name and matches the
+    # Python field; `fps` is an alias for OpenAI-shape clients.
+    num_frames: Optional[int] = None
+    seconds: Optional[float] = None
+    frame_rate: Optional[float] = Field(default=None, alias="fps")
+
+    # TRT-LLM-supported per-request params (1:1 with VisualGenParams)
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    max_sequence_length: Optional[int] = None
+    negative_prompt: Optional[str] = None
+    image_cond_strength: Optional[float] = None  # I2V/I2I conditioning
+
+    # Model-specific overflow
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."
+        ),
+    )
+
+    # Accepted-but-ignored OpenAI-shaped fields (warn-on-set; see §7.1 table)
+    model: Optional[str] = None
+```
+
+Notes specific to the video schema:
+
+- `n` is intentionally not on the video request. OpenAI's video API
+  doesn't expose it, and the Python `VisualGen.generate(...)` per-batch
+  semantics for video are single-sample. If multi-sample video lands
+  later, `n` can be reintroduced symmetrically with the image side.
+- `num_frames` vs `seconds`/`frame_rate`: when the client sends
+  `num_frames` it wins. Otherwise the conversion computes
+  `int(seconds * frame_rate)` from whichever of `seconds` and
+  `frame_rate` the client sent (each falls through to the pipeline
+  default when absent — per §7.0). Per the I2V convention
+  (`pipeline_wan_i2v.py:485-492`), `num_frames` must satisfy
+  `num_frames % vae_scale_factor_temporal == 1`; the pipeline rounds
+  with a warning, but clients targeting an exact frame count should
+  send `num_frames` directly.
 
 ### 7.3 New `extra_params` semantics on HTTP
 
@@ -784,43 +854,138 @@ class VideoGenerationRequest(OpenAIBaseModel):
   where `guidance_scale_2`, `boundary_ratio` live. For Wan 2.1
   clients, `extra_params` must be omitted or empty.
 
-### 7.4 Settling the `seed` semantics
+### 7.4 `seed` — an instance of the general rule
 
-This design picks **HTTP `seed: Optional[int] = None` means "no seed =
-random."** OpenAI's image-API documents `seed` as optional, and clients
-have strong intuition that omitted seed implies non-deterministic
-generation; mapping `None` to a documented `42` default would be a UX
-trap that documentation alone cannot fix. The implementation has two
-parts:
+`seed` is the field that most needed clarifying, but under §7.0 it's
+no longer a special case. HTTP `seed: Optional[int] = None`; Python
+`VisualGenParams.seed: Optional[int] = None` (flipped from `int = 42`).
+When the client omits or sends `null`, the conversion does not set
+`params.seed`, and the engine treats `None` as "fresh random seed per
+request" (resolved by the executor — see §10.4). Explicit integers
+reproduce.
 
-- **HTTP:** `seed: Optional[int] = None`. When the client omits it,
-  the conversion does NOT set `params.seed`; the engine generates a
-  fresh seed per request.
-- **Python:** `VisualGenParams.seed: Optional[int] = None` (flipped
-  from `int = 42`). The engine treats `None` as "fresh random seed
-  per request"; explicit integers reproduce.
+The Python-side flip from `seed: int = 42` to `Optional[int] = None`
+is a deliberate, bounded break — every existing Python caller that
+relies on the documented `42` default for reproducibility must now
+pass `seed=42` explicitly. The §10.2 migration plan inventories the
+six pipeline files and two test fixtures that need touch-ups; the
+Python change is the small price for "no seed = random" being honest
+across both surfaces.
 
-This **closes Open Question §11.2**. It is a deliberate Python-side
-break: every Python caller that today relies on the documented `42`
-default for reproducibility must now pass `seed=42` explicitly. The
-change is small and discoverable (the default flip is in
-`VisualGenParams.seed`'s `Field(default=None, description="...")`),
-and the affected test files (`test_visual_gen_params.py`,
-`test_visual_gen.py`) are the natural place to add the regression.
-
-The §5.1 bug (image `seed` silently dropped at the HTTP layer) is
-fixed by the universal seed overlay in §8.
+This **closes Open Question §11.2**. The §5.1 bug (image `seed`
+silently dropped at the HTTP layer) is fixed by the universal seed
+overlay in §8.1.
 
 ### 7.5 What stays the same
 
-- `size: "WxH"` string, validated by regex (already in place).
-- `n` ranges (image: 1..10; video: 1..4).
+- `size: "WxH"` string, validated by regex (still in place; complemented by `width`+`height` as structured alternative).
 - `input_reference` as base64 / `UploadFile` (no server-local paths).
-- `seconds` × `fps` derivation for `num_frames`.
-- `fps: int` (HTTP) → `frame_rate: float` (Python), implicit promotion.
-- All "kept" fields are unchanged in shape and constraint.
+- `seconds × frame_rate` derivation for `num_frames` when the client doesn't send `num_frames` directly.
 
----
+### 7.6 Tensor-return output formats
+
+The Python `VisualGen.generate(...)` already returns a `torch.Tensor`
+(see `tensorrt_llm/visual_gen/output.py:VisualGenOutput`): shape
+`(B, H, W, C)` uint8 for images, `(B, T, H, W, C)` for video, and an
+optional `(B, channels, T_audio)` float32 audio tensor for LTX-2. The
+serve layer today encodes the visual tensor to PNG/MP4 before
+returning. Some workflows (programmatic post-processing, custom
+display pipelines, research integrations) want the raw tensor instead.
+
+The HTTP shape: extend `output_format` to include tensor formats.
+Transport composes orthogonally with the existing `response_format`
+(`url` writes a file and returns its URL; `b64_json` base64-encodes
+the serialized bytes inline). The conversion writes the
+`VisualGenOutput` tensors with the chosen serializer instead of
+running the PNG/MP4 encoder.
+
+**Format comparison (multi-tensor support is the key axis since LTX-2
+returns video + audio + frame_rate metadata together):**
+
+| Format | Self-describing? | Multi-tensor support | Security on load | Load path |
+| --- | --- | --- | --- | --- |
+| **safetensors** | Yes — header carries `{name: {dtype, shape, offsets}}` for every tensor in the file plus a JSON `metadata` field for scalar metadata | Native — single file holds a dict of named tensors | No pickle; bytes are pure tensor data + header | `safetensors.torch.load(bytes)` returns `Dict[str, torch.Tensor]`; `safetensors.numpy.load(...)` returns NumPy arrays |
+| **PyTorch `.pt`** (`torch.save`) | Yes (pickle stores Python types incl. shape/dtype) | Native — `torch.save({"video": ..., "audio": ..., "frame_rate": 24.0})` writes a dict | **Uses pickle → arbitrary code on load.** Trusted bytes only | `torch.load(buf, weights_only=True)` since PyTorch 2.4+ refuses non-tensor pickled types and is safe; pre-2.4 is unsafe |
+| **NumPy `.npz`** (`numpy.savez`) | Yes (zip archive of `.npy` files; each `.npy` has its own shape/dtype header) | Yes via the zip archive | Safe (`allow_pickle=False`) | `numpy.load(buf)` returns a `NpzFile` mapping; tensors via `torch.from_numpy(npz["video"])` |
+
+(NumPy `.npy` single-array is also listed in some surveys but
+deliberately excluded here because it can't carry the multi-tensor
+case LTX-2 needs.)
+
+**Multi-tensor packaging for the LTX-2 case** (video + audio +
+frame_rate + audio_sample_rate):
+
+- **safetensors**: one file. Named tensors `{"video": ..., "audio":
+  ...}`. Scalar metadata (`frame_rate`, `audio_sample_rate`) goes in
+  the file's `metadata: dict[str, str]` header — safetensors accepts
+  string metadata only, so floats are serialized as strings. The
+  client deserializes them on read. (Alternative: store metadata as
+  0-d tensors, which keeps everything strongly typed but adds tensor
+  unpack steps on the client.)
+- **`.pt`**: one file. `torch.save({"video": ..., "audio": ...,
+  "frame_rate": 24.0, "audio_sample_rate": 16000})`. Dict semantics
+  preserve types natively.
+- **`.npz`**: one zip. Each tensor is a separate `.npy` entry inside.
+  Scalar metadata goes in as 0-d arrays. The client iterates the
+  `NpzFile` to reconstruct.
+
+All three handle the multi-tensor case. safetensors and `.pt` are
+both first-class dict serializers; `.npz` works but is a zip archive
+of single-array files, which is less natural for the "one logical
+output with named parts" use case here.
+
+**Recommendation: support both `safetensors` and `pt`; default to
+`safetensors`.**
+
+- **`output_format="safetensors"`** is the default tensor option. No
+  pickle on load; the file is fully self-describing; ecosystem
+  familiarity (safetensors is the default for HF models, which all
+  VisualGen pipelines already pull). Server uses
+  `safetensors.torch.save(tensors, metadata={...})`; client loads
+  with `safetensors.torch.load(bytes)` or the file-based variant.
+- **`output_format="pt"`** is the opt-in PyTorch-native path for
+  workflows that already use `torch.load`. Server uses `torch.save`;
+  client loads with `torch.load(buf, weights_only=True)` (safe path
+  in PyTorch 2.4+). Documented as "PyTorch ≥ 2.4 recommended for
+  safe load."
+- **`output_format` does not include `npz`.** Rationale: it offers no
+  property the other two don't, has a less natural multi-tensor
+  shape, and adds a third surface to test. If a strong NumPy-only
+  client appears later, adding it is a one-field schema change plus
+  one serializer.
+
+The two formats share the same `response_format` transport: `url`
+mode writes the bytes to `media_storage_path / "<id>.<ext>"` and
+returns its URL; `b64_json` mode base64-encodes the bytes into the
+response body. The conversion picks the extension and serializer
+based on `output_format` and the modality of `VisualGenOutput`.
+
+**Why not just one format?** The user-survey signal is that PyTorch
+users overwhelmingly reach for `torch.load`, and forcing them through
+the `safetensors` import is friction. Supporting both keeps the
+schema honest about which formats are first-class while letting
+safetensors be the "secure default" recommendation in docs.
+
+### 7.7 OpenAI-shaped fields kept with no semantic
+
+OpenAI-compatible clients pass several fields for which TRT-LLM has
+no equivalent action — they shape the OpenAI surface, not the
+inference. The schema retains them so callers can pass through the
+`extra="forbid"` wall, with the conversion no-op'ing and (where
+useful) logging a WARNING:
+
+| Field | Endpoint | Behavior |
+| --- | --- | --- |
+| `model` | both | If non-`None` and mismatches the loaded model id: log WARNING. trtllm-serve is single-model per process; the field exists to keep OpenAI-SDK clients happy. |
+| `quality` | image | If non-`None`: log WARNING ("`quality` accepted for OpenAI-SDK compatibility but ignored; pass `num_inference_steps` for explicit step control"). |
+| `style` | image | Same treatment as `quality`. |
+| `user` | image | Silently accepted; OpenAI-shape trace field with no TRT-LLM semantic. No warning to keep request logs clean. |
+
+These are not the same as `extra_params` — they live in the schema
+because OpenAI clients send them as known top-level fields, but they
+have no path into the engine. New OpenAI-shape fields that arrive
+later are added to this list (warn-on-set if they have intent the
+server can't honor, silent-accept if they're trace metadata only).
 
 ## 8. Conversion layer
 
@@ -842,9 +1007,16 @@ def parse_visual_gen_params(
 ) -> VisualGenParams:
     params = generator.default_params
 
-    # Universal overlays (both image and video)
-    if request.size is not None and request.size != "auto":
+    # Resolution: width+height (if both sent) wins; else "WxH" parsed; else
+    # neither is set and the pipeline default applies. Sending exactly one
+    # of {width, height} is a 422 from the Pydantic model_validator (§7.1).
+    if request.width is not None and request.height is not None:
+        params.width, params.height = request.width, request.height
+    elif request.size is not None and request.size != "auto":
         params.width, params.height = map(int, request.size.split("x"))
+
+    # Per-request params — only override when the client sent a real value.
+    # Each "if not None" is the §7.0 general rule in action.
     if request.negative_prompt is not None:
         params.negative_prompt = request.negative_prompt
     if request.num_inference_steps is not None:
@@ -853,20 +1025,35 @@ def parse_visual_gen_params(
         params.guidance_scale = request.guidance_scale
     if request.max_sequence_length is not None:
         params.max_sequence_length = request.max_sequence_length
-    if request.n is not None:
-        params.num_images_per_prompt = request.n
     if request.seed is not None:
         params.seed = int(request.seed)
-    # `quality` is intentionally not consumed (no-op pass-through per §7.1).
 
-    # Video-only overlays
+    # Video-only universal: image_cond_strength (only on VideoGenerationRequest)
+    if (isinstance(request, VideoGenerationRequest)
+            and request.image_cond_strength is not None):
+        params.image_cond_strength = request.image_cond_strength
+
+    # Image-only: `n` (video doesn't expose n per §7.2 notes).
+    if isinstance(request, ImageGenerationRequest):
+        if request.n is not None:
+            params.num_images_per_prompt = request.n
+
+    # Video-only: frame budget + reference image.
     if isinstance(request, VideoGenerationRequest):
-        params.frame_rate = request.fps
-        params.num_frames = int(request.seconds * request.fps)
+        if request.frame_rate is not None:
+            params.frame_rate = request.frame_rate
+        # num_frames preferred; fall back to seconds * frame_rate if absent.
+        if request.num_frames is not None:
+            params.num_frames = request.num_frames
+        elif request.seconds is not None and params.frame_rate is not None:
+            params.num_frames = int(request.seconds * params.frame_rate)
         if request.input_reference is not None:
             params.image = _materialize_reference(
                 request.input_reference, id, media_storage_path,
             )
+
+    # OpenAI-shaped fields kept with no engine semantic — warn-on-set.
+    _warn_if_set_with_no_semantic(request, generator.loaded_model_id)
 
     # Model-specific overflow — see §8.3 for normative merge semantics.
     _merge_extra_params(
@@ -876,25 +1063,37 @@ def parse_visual_gen_params(
     return params
 ```
 
-(`_materialize_reference` and `_merge_extra_params` are small helpers
-defined below. `_materialize_reference` holds today's base64-decode-
-and-write-to-disk logic from `visual_gen_utils.py:60-70`.)
+(`_materialize_reference`, `_warn_if_set_with_no_semantic`, and
+`_merge_extra_params` are small helpers. `_materialize_reference`
+holds today's base64-decode-and-write-to-disk logic from
+`visual_gen_utils.py:60-70`. `_warn_if_set_with_no_semantic` walks
+the per-§7.7 list and logs a WARNING when fields like `quality` or
+`style` have a non-None value; for `model` it also checks for
+mismatch with the loaded model id. `output_format` is consumed by
+the response-building path in `openai_server.py`, not by
+`parse_visual_gen_params`, since it controls encoding rather than
+engine params — see §7.6.)
 
 ### 8.2 What changes vs today
 
 - Image branch now reads `request.seed` (fixes §5.1).
-- `quality` branch removed: the field stays on the schema (per §7.1
-  adoption check), but the conversion no longer maps it to anything.
-  Closes §5.4.
+- `quality="hd" → num_inference_steps=30` mapping removed: the
+  field stays on the schema (per §7.1 adoption check), but the
+  conversion no longer overrides any param. Closes §5.4.
 - `guidance_rescale` special-case removed (drops §5.3); arrives via
   `extra_params` instead, routed through `_merge_extra_params`.
 - `extra_params` is merged from the request body via the normative
   rule in §8.3 (new).
-- `max_sequence_length` is now mapped (was previously absent — see
-  the schema addition in §7.1).
-- Image and video branches collapse into a single common path plus
-  a small video-only block — fewer `isinstance(...)` checks, fewer
-  surfaces for drift.
+- `max_sequence_length`, `width`/`height`, `num_frames`, and
+  `frame_rate` (with `fps` alias) are now wired (new fields per §7).
+- `n` removed from the video branch (only image carries it per
+  §7.2 notes).
+- OpenAI-shaped no-semantic fields (`model`, `quality`, `style`) are
+  passed through `_warn_if_set_with_no_semantic`. `user` is silently
+  accepted with no log noise.
+- Image and video branches share the universal block; image-only
+  (`n`) and video-only (frame budget, `input_reference`) are
+  scoped under `isinstance` blocks.
 
 ### 8.3 Normative merge semantics for `extra_params`
 
@@ -985,15 +1184,13 @@ Three layers, in order:
 
 1. **HTTP boundary** — Pydantic on the request model.
    - `extra="forbid"` rejects unknown top-level keys → 422.
-   - `Field(ge=..., le=...)` rejects out-of-range numeric scalars → 422.
    - `pattern=...` on `size` rejects malformed strings → 422.
+   - `model_validator(mode="after")` rejects "exactly one of width/height" → 422.
    - Type errors (`seed="42"` instead of `seed=42`) → 422.
 2. **Conversion** — `parse_visual_gen_params`.
    - Limited to translation, not validation. Only domain-specific
-     conversion errors are raised here (e.g.
-     `input_reference` without `media_storage_path` →
-     `ValueError` → 400 via the endpoint's existing
-     `create_error_response`).
+     conversion errors raised here (e.g. `input_reference` without
+     `media_storage_path` → `ValueError` → 400).
 3. **Executor** — `DiffusionExecutor._validate_request`
    (`tensorrt_llm/_torch/visual_gen/executor.py:243-311`).
    - Unknown `extra_params` keys → `ValueError`.
@@ -1003,172 +1200,147 @@ Three layers, in order:
 
 The endpoint handlers (`openai_video_routes.py:101-103, 229-231`;
 parallel pattern in `openai_server.py` image endpoint) already catch
-`ValueError` and surface it as 400 via `create_error_response`. The
-design extends this with a structured JSON envelope and a hint
-catalogue (§9.1, §9.2) so the HTTP response body is a stable contract
-rather than the executor's raw Python string.
+`ValueError` and surface it as 400 via `create_error_response`.
 
 **Status codes:**
 
 | Failure mode | Layer | Status |
 | --- | --- | --- |
-| Unknown top-level field | Pydantic | 422 |
-| Out-of-range scalar / bad `size` string | Pydantic | 422 |
-| Unknown `extra_params` key for this model | Executor | 400 |
-| `extra_params` type mismatch | Executor | 400 |
-| `extra_params` out-of-range | Executor | 400 |
+| Unknown top-level field / bad type / bad `size` format | Pydantic | 422 |
+| Unknown `extra_params` key / type mismatch / out-of-range | Executor | 400 |
 | Conversion failure (e.g. missing `media_storage_path`) | Conversion | 400 |
 
-The 422 / 400 split is intentional and matches FastAPI's defaults:
-422 is "request body could not be parsed", 400 is "request was
-parsed but is semantically invalid for the loaded model".
+The 422 / 400 split matches FastAPI's defaults: 422 is "request body
+could not be parsed", 400 is "request was parsed but is semantically
+invalid for the loaded model".
 
-### 9.1 JSON error envelope
+### 9.1 Error response shape — two options
 
-All HTTP error bodies from the visual_gen endpoints share one shape,
-independent of which layer raised the error. This decouples the HTTP
-API contract from the executor's internal Python `ValueError` text.
+The error-body shape is **not fully settled in this design** and
+should be discussed with the trtllm-serve owner before the impl PR
+lands. Both options below are viable; the design's tentative pick is
+Option A (match the existing LLM serve shape).
 
-```json
-{
-  "error": {
-    "code": "<stable_error_code>",
-    "message": "<human-readable summary>",
-    "param": "<json-path to the offending field, when applicable>",
-    "hint": "<optional remediation; see §9.2>",
-    "details": { /* layer-specific structured fields */ }
-  }
-}
-```
+**Option A — Match LLM serve shape exactly (this design's tentative pick).**
 
-Stable error codes (extensible):
-
-| `code` | Layer | When | `param` |
-| --- | --- | --- | --- |
-| `unknown_top_level_field` | Pydantic | Unknown key at the request root | `<field name>` |
-| `field_validation_error` | Pydantic | Range/type/regex failure on a known field | `<field name>` |
-| `unknown_extra_param` | Executor | Key not in `extra_param_specs` for the loaded model | `extra_params.<key>` |
-| `extra_param_type_mismatch` | Executor | Value type doesn't match `ExtraParamSchema.type` | `extra_params.<key>` |
-| `extra_param_out_of_range` | Executor | Value outside `ExtraParamSchema.range` | `extra_params.<key>` |
-| `unsupported_universal_field` | Executor | Universal field (e.g. `num_frames`) set but pipeline doesn't declare it | `<field name>` |
-| `conversion_error` | Conversion | e.g. missing `media_storage_path` | varies |
-
-**Ownership boundary (HTTP codes live in `serve/`, not in the
-engine).** Iter 2 review correctly flagged that pushing HTTP code
-strings like `"unknown_extra_param"` into the executor blurs layering
-and risks breaking Python callers that catch `ValueError`. The
-revised plan:
-
-- **Engine:** a transport-neutral validation error in
-  `tensorrt_llm/_torch/visual_gen/executor.py`:
-
-  ```python
-  class VisualGenValidationError(ValueError):
-      """Raised by DiffusionExecutor._validate_request for parameter
-      violations. Subclasses ValueError so existing Python call
-      sites that ``except ValueError`` continue to work.
-      """
-      def __init__(
-          self,
-          reason: Literal[
-              "unknown_extra_param",
-              "extra_param_type_mismatch",
-              "extra_param_out_of_range",
-              "unsupported_universal_field",
-          ],
-          param: str,           # field name or extra_params.<key>
-          message: str,         # human-readable; today's text
-          details: Optional[Dict[str, Any]] = None,
-      ):
-          super().__init__(message)
-          self.reason = reason
-          self.param = param
-          self.details = details or {}
-  ```
-
-- **Serve layer:** the endpoint handlers catch
-  `VisualGenValidationError` and translate `reason` → HTTP `code`,
-  populate `param` and `details`, build the §9.1 envelope. The
-  engine never sees the HTTP `code` string. The
-  `reason → code` mapping is a small dict in
-  `tensorrt_llm/serve/`.
-
-- **Backwards compat:** because `VisualGenValidationError` subclasses
-  `ValueError`, every existing `except ValueError` (Python callers,
-  tests, endpoint exception handlers) keeps working unchanged. The
-  serve layer adds the more specific catch as an inner `except`
-  clause inside the existing `except ValueError` block.
-
-The previous `ValueError`-as-API-contract pattern is preserved as the
-fallback (for any executor code path that hasn't been migrated to
-raise `VisualGenValidationError`), but new validation cases go
-through the typed exception.
-
-### 9.2 Dynamic hint generation for relocated top-level keys
-
-The hint is **derived dynamically** from the loaded pipeline's
-`extra_param_specs`, not from a hand-maintained static catalogue.
-This keeps the discoverability story honest as new models add new
-`extra_param_specs` keys — no second source of truth to drift.
+Reuse `tensorrt_llm/serve/openai_server.py:557-566`'s
+`create_error_response(message, err_type, status_code)`:
 
 ```python
-# Cached on the server at generator load / model swap time.
-# Set to None when no generator is loaded (startup, mid-swap).
-_extra_param_keys_cache: Optional[frozenset[str]] = None
-
-def _refresh_extra_param_keys_cache(generator: Optional[VisualGen]) -> None:
-    """Called by the server on startup, on model swap, and after any
-    generator reload. Idempotent.
-    """
-    global _extra_param_keys_cache
-    if generator is None:
-        _extra_param_keys_cache = None
-    else:
-        _extra_param_keys_cache = frozenset(generator.extra_param_specs.keys())
-
-def _hint_for_unknown_top_level_key(key: str) -> Optional[str]:
-    """Look up the offending unknown top-level key against:
-    (a) the loaded pipeline's extra_param_specs (cached at load time —
-        not recomputed per request, cannot raise on attacker-driven
-        bad input), and
-    (b) a small frozen alias map for keys removed from the schema
-        (historical typo defenses; today: empty).
-    """
-    if _extra_param_keys_cache is not None and key in _extra_param_keys_cache:
-        return (
-            f"'{key}' is not a top-level field for this model. Pass it "
-            f"via extra_params: {{'extra_params': {{'{key}': ...}}}}."
-        )
-    # Reserved for historical aliases (currently empty). Add entries
-    # only when a top-level field is removed from the schema and we
-    # want a corrective message for clients still sending it.
-    historical_aliases: dict[str, str] = {}
-    return historical_aliases.get(key)
+def create_error_response(
+    message: str,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> Response:
+    error_response = ErrorResponse(
+        message=message, type=err_type, code=status_code.value
+    )
+    return JSONResponse(content=error_response.model_dump(),
+                        status_code=error_response.code)
 ```
 
-When the Pydantic `RequestValidationError` indicates an
-`unknown_top_level_field`, the FastAPI exception handler calls
-`_hint_for_unknown_top_level_key(field_name)` and sets `error.hint`
-to the returned string when non-`None`. Two robustness properties:
+Wire format:
 
-- **Cached**, not recomputed per request — the validation-error
-  path runs on attacker-controllable input, so a per-error lazy
-  `generator.extra_param_specs` call would be a tiny DoS surface.
-  The cache is a `frozenset` populated once at load.
-- **No-generator-loaded fallback** — during server startup or a
-  model swap, the cache is `None` and the helper returns `None`.
-  The error path falls back to a plain "field not permitted" 422
-  rather than crashing with `AttributeError`.
+```json
+{ "message": "Unknown extra_params ['stg_sclae'] for LTX2Pipeline. Supported: ['guidance_rescale', 'stg_scale', ...].",
+  "type": "BadRequestError",
+  "code": 400 }
+```
 
-If the key is unknown to both the cache *and* the historical-alias
-map, the error stays a plain 422 — the typo case continues to fail
-loud.
+- `code` is the HTTP status integer (consistent with LLM serve and
+  OpenAI's error type).
+- `type` is the coarse OpenAI-style label (`"BadRequestError"`,
+  `"InvalidRequestError"`, `"NotImplementedError"`).
+- `message` carries the executor's existing text verbatim — which
+  already names the offending key and the supported set for the
+  loaded model.
 
-The single key that has Python usage in tests/examples
-(`guidance_rescale`, used in `examples/visual_gen/visual_gen_ltx2.py`
-through Python's `extra_params` dict) is automatically covered for
-any model that declares it in `extra_param_specs` (today: LTX2). No
-manual entry required. Test coverage in §10.
+Pros: zero new contract surface, exact parity with the LLM serve
+half of `trtllm-serve`, fewer fields for clients to handle.
+
+Cons: clients that want to programmatically distinguish "key typo"
+from "out-of-range value" must parse `message` text — fragile if the
+executor's wording ever changes. There's no machine-readable param
+pointer to the offending field.
+
+**Option B — Add an `error_subtype` discriminator (alternative for
+trtllm-serve-owner discussion).**
+
+Same shape as Option A plus one optional discriminator field and an
+optional `param` pointer:
+
+```json
+{ "message": "Unknown extra_params ['stg_sclae'] for LTX2Pipeline. Supported: [...].",
+  "type": "BadRequestError",
+  "code": 400,
+  "error_subtype": "unknown_extra_param",
+  "param": "extra_params.stg_sclae" }
+```
+
+Stable subtypes: `unknown_extra_param`, `extra_param_type_mismatch`,
+`extra_param_out_of_range`, `unsupported_universal_field`,
+`unknown_top_level_field`, `field_validation_error`,
+`conversion_error`. Clients that don't care ignore the new fields;
+clients that want programmatic retry/branching consume them.
+
+Pros: machine-readable; future-proofs the API for client SDKs
+without breaking the LLM-serve-shape contract; tiny extension.
+
+Cons: a layer LLM serve doesn't have today, and once added becomes a
+maintenance commitment.
+
+**Engine-side exception shape (both options).** Whichever wire
+shape lands, the engine raises a transport-neutral
+`VisualGenValidationError(ValueError)` carrying structured fields
+(`reason`, `param`, `message`, `details`); the serve layer reads
+them and builds the response per the chosen option. The exception
+subclasses `ValueError`, so Python callers' `except ValueError`
+blocks keep working — preserved across both options.
+
+```python
+# tensorrt_llm/_torch/visual_gen/executor.py
+class VisualGenValidationError(ValueError):
+    """Raised by DiffusionExecutor._validate_request for parameter
+    violations. Subclasses ValueError so existing Python call sites
+    that ``except ValueError`` continue to work. Transport-neutral —
+    the serve layer maps `reason` to whichever wire shape ships.
+    """
+    def __init__(
+        self,
+        reason: Literal[
+            "unknown_extra_param",
+            "extra_param_type_mismatch",
+            "extra_param_out_of_range",
+            "unsupported_universal_field",
+        ],
+        param: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.param = param
+        self.details = details or {}
+```
+
+Under Option A, the serve layer reads `e.message` and ignores the
+structured fields (or includes them in server-side logs only). Under
+Option B, the serve layer also writes `error_subtype = e.reason` and
+`param = e.param` to the response.
+
+### 9.2 No hint generator
+
+An earlier draft proposed a dynamic hint generator that rewrites the
+422 body for relocated top-level keys (e.g. "`guidance_rescale` is
+not a top-level field; pass it via `extra_params`"). This is
+intentionally **not** in scope. The discoverability benefit is
+modest given that `guidance_rescale` is the only realistic case
+today (and `extra_param_specs` documentation is the better surface
+for that information). Adding the catalogue + cache + invalidation
+machinery to support it is a layer LLM serve doesn't have, and the
+plain 422 from `extra="forbid"` is clear enough — `"extra_params"`
+is documented in the schema's `extra_params` field description as the
+destination for model-specific keys.
 
 ---
 
@@ -1179,17 +1351,17 @@ Coordinated PR (or short series) touching:
 
 | File | Change |
 | --- | --- |
-| `tensorrt_llm/serve/openai_protocol.py` | Edit `ImageGenerationRequest` and `VideoGenerationRequest` per §7. Drop `style` and top-level `guidance_rescale`. Add `extra_params` and `max_sequence_length`. Keep `quality` as no-op. |
-| `tensorrt_llm/serve/visual_gen_utils.py` | Rewrite `parse_visual_gen_params` per §8 (including `_merge_extra_params` per §8.3). |
-| `tensorrt_llm/serve/openai_video_routes.py` | Wire the JSON error envelope (§9.1) into `create_error_response`. |
-| `tensorrt_llm/serve/openai_server.py` | Same for the image endpoint. Add the hint-catalogue exception handler for unknown-top-level Pydantic errors (§9.2). |
-| `tensorrt_llm/visual_gen/params.py` | Flip `seed: int = 42` → `seed: Optional[int] = None` (§7.4). |
-| `tensorrt_llm/_torch/visual_gen/executor.py` | Introduce `VisualGenValidationError(ValueError)` carrying transport-neutral `reason`/`param`/`details` (§9.1); switch `_validate_request` to raise it instead of plain `ValueError` for the four validation cases. Resolve `params.seed is None` at this layer (§10.4) by drawing once and broadcasting to ranks. Fix the docstring/code inconsistency from §5.5. |
-| `tensorrt_llm/serve/` (new small file or co-located with `openai_server.py`) | The `reason → HTTP code` mapping (`unknown_extra_param`, `extra_param_type_mismatch`, etc.) lives here, not in the engine. |
-| `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py` | Extend (§10.1). The file already mocks `VisualGen` via `MockVisualGen` and uses FastAPI's `TestClient` — no GPU required. |
-| `tests/unittest/_torch/visual_gen/test_visual_gen_params.py` | Add a regression for `seed=None` random generation; update any existing case that relied on `42`. |
-| `examples/visual_gen/serve/README.md` | Update parameter list: remove `style`; note `quality` is a no-op pass-through; document `extra_params` with per-model accepted keys. |
-| `docs/source/models/visual-generation.md` (and related) | Document the per-model `extra_params` accepted keys. Defer to a follow-up doc PR if the doc structure isn't settled. |
+| `tensorrt_llm/serve/openai_protocol.py` | Rewrite `ImageGenerationRequest` and `VideoGenerationRequest` per §7.1/§7.2. Add `extra_params`, `max_sequence_length`, `width`/`height`, `num_frames`, `frame_rate` (with `fps` alias). Drop top-level `guidance_rescale` and `n` (video). Keep `model`/`quality`/`style`/`user` as accept-and-warn (§7.7). Extend `output_format` to include `"safetensors"` and `"pt"` (§7.6). |
+| `tensorrt_llm/serve/visual_gen_utils.py` | Rewrite `parse_visual_gen_params` per §8. Add `_warn_if_set_with_no_semantic` for accept-and-warn fields, `_merge_extra_params` per §8.3, and tensor-format serializers per §7.6. Drop the `mask` write path (the field is being removed from `VisualGenParams`). |
+| `tensorrt_llm/serve/openai_video_routes.py` | Wire `VisualGenValidationError → create_error_response` per §9.1's chosen option. Add tensor-format response path (write `.safetensors`/`.pt` bytes via `media_storage_path` for `response_format="url"`, base64-encode for `b64_json`). |
+| `tensorrt_llm/serve/openai_server.py` | Same for the image endpoint. |
+| `tensorrt_llm/visual_gen/params.py` | Flip `seed: int = 42` → `seed: Optional[int] = None` (§7.4). **Remove the `mask` field** — confirmed unused by any pipeline; only written-to from the unimplemented `/v1/images/edits` route. |
+| `tensorrt_llm/_torch/visual_gen/executor.py` | Introduce `VisualGenValidationError(ValueError)` carrying transport-neutral `reason`/`param`/`details` (§9.1); switch `_validate_request` to raise it for the four validation cases. Resolve `params.seed is None` at this layer (§10.4) by drawing once with `secrets.randbits(63)`. Fix the docstring/code inconsistency from §5.5. |
+| `tensorrt_llm/serve/` (small co-located module) | The `reason → HTTP code` mapping lives here (not in the engine). Under §9.1 Option A this is a one-liner; under Option B it's a small dict. |
+| `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py` | Extend (§10.1). Already mocks `VisualGen` via `MockVisualGen` and uses FastAPI's `TestClient` — no GPU required. |
+| `tests/unittest/_torch/visual_gen/test_visual_gen_params.py` | Add a regression for `seed=None`; update existing case that relied on `42`. Remove the `mask` default assertion. |
+| `examples/visual_gen/serve/README.md` | Update parameter list: note `quality`/`style`/`model` are accept-and-warn; document `extra_params` with per-model accepted keys; document tensor return formats. |
+| `docs/source/models/visual-generation.md` (and related) | Document the per-model `extra_params` accepted keys and the new tensor-return `output_format` values. Defer to a follow-up doc PR if structure isn't settled. |
 
 ### 10.1 Test plan (HTTP unit + integration split)
 
@@ -1208,11 +1380,12 @@ obvious and capture-point issues are avoided:
 
 - **Schema-only tests** (`test_trtllm_serve_endpoints.py`,
   `TestClient`-driven, no `params` capture needed): unknown top-level
-  fields → 422 with `code=unknown_top_level_field`; mismatched
-  types/ranges → 422 with `code=field_validation_error`; hint
-  generator (§9.2) fires for keys in the loaded mock's
-  `extra_param_specs`. Schema acceptance for every preserved field
-  on both image and video request models.
+  fields → 422; mismatched types/regex → 422; `width`/`height`
+  paired-or-error validator → 422 when only one is sent; schema
+  acceptance for every preserved field on both image and video
+  request models. Tensor `output_format` values (`safetensors`,
+  `pt`) → 200 with the right `Content-Type` (under `response_format=url`)
+  or the right base64 prefix (under `b64_json`).
 - **Conversion tests** (a new `test_visual_gen_utils.py` or extension
   of an existing file): call `parse_visual_gen_params(...)` and
   `_merge_extra_params(...)` directly with constructed Pydantic
@@ -1366,26 +1539,13 @@ default; verify no `if seed == 42` / `if not seed` branches remain.
 
 ## 11. Open Questions
 
-### 11.1 Fix the five §5 bugs in this design's PR, or separately?
+### 11.1 ~~Fix the §5 bugs in this design's PR, or separately?~~ *Resolved: all bugs fix here; "discuss options" framing was not the right shape.*
 
-All five bugs resolve as side-effects of the redesign:
-
-- §5.1 (image `seed` silently dropped) — fixed by the universal seed
-  overlay in §8.1.
-- §5.2 (`seed` default semantics mismatch) — fixed by the Python flip
-  to `Optional[int] = None` in §7.4, which makes "no seed = random"
-  the consistent semantics on both sides.
-- §5.3 (`guidance_rescale` per-model invalid as top-level) — fixed
-  by moving it into `extra_params` (§7.1, §7.2) plus the hint catalogue
-  for the legacy spelling (§9.2).
-- §5.4 (`quality="hd"` overrides model default) — fixed by keeping
-  the field as no-op pass-through and removing the conversion mapping
-  (§7.1, §8.2).
-- §5.5 (executor docstring/code inconsistency) — one-line comment
-  edit listed in the §10 migration plan.
-
-**Answer:** all five resolve in the redesign PR. If the PR gets too
-big, peel §5.5 off (zero-risk one-line nit).
+The five §5 bugs all resolve as side-effects of the redesign in
+this PR. The original "tentative answer, peel §5.5 off if needed"
+framing was the wrong shape — the §5 bugs are not optional triage,
+they are the *reason* the redesign exists. Each bug's resolution
+mechanism is named in its own §5.* sub-section.
 
 ### 11.2 ~~Should Python `VisualGenParams.seed` flip to `Optional[int] = None`?~~ *Resolved in §7.4.*
 
@@ -1400,15 +1560,22 @@ Out of scope here. When/if Python gains per-item support, the HTTP
 side likely grows a `seeds: Optional[List[int]] = None` or similar
 sibling. Not designing that today.
 
-### 11.4 Video inpainting
+### 11.4 ~~Video inpainting via `mask`~~ *Closed: `VisualGenParams.mask` is being dropped (no pipeline consumes it). `image_cond_strength` is general.*
 
-`VisualGenParams.mask` and `image_cond_strength` exist Python-side
-and are wired through I2V pipelines. HTTP has no path. Either
-extend `VideoGenerationRequest` with `mask` + `image_cond_strength`,
-or leave video inpainting Python-only.
+The `mask` field on `VisualGenParams` is dead code as of this branch:
+defined at `params.py:62`, written-to only by the unimplemented
+`/v1/images/edits` route's conversion path, and **read by zero
+pipelines** (broad grep confirmed — all other `*_mask` references in
+`_torch/visual_gen/models/` are internal attention/denoise tensors,
+unrelated to the user-facing field). The §10 migration plan drops it.
 
-Out of scope here; flagged for a follow-up design when the I2V HTTP
-surface is decided.
+`image_cond_strength` is a different story — it *is* consumed, and
+by more than one model family (Wan I2V at
+`models/wan/defaults.py:134` and LTX2 at `models/ltx2/pipeline_ltx2.py:1321`).
+Exposing it on `VideoGenerationRequest` as a top-level
+`Optional[float]` is straightforward and consistent with §7's
+universal-fields treatment. **Folded into the redesign**: added to
+the video schema in §7.2.
 
 ### 11.5 ~~`max_sequence_length` exposure~~ *Resolved: added top-level (§7.1, §7.2, §8.1).*
 
@@ -1444,12 +1611,17 @@ later input.**
 | 4  | 2026-05-26 | Convergence pass: verified iter-3 resolutions; caught one stale §10.2 reference to pre-§10.4 pipeline-local seed logic | 5       | 5        | 0    | 0        |
 | 5  | 2026-05-26 | Final convergence check: verified the §10.2 fix landed and no third-place stale references remain. Codex returned "Convergence reached." | 0       | —        | 0    | 0        |
 
-**Converged on 2026-05-26 after 5 iterations.** Total: 27 substantive
-threads raised across the loop, 27 resolved (including the iter-2
-re-opens of partially-addressed iter-1 critiques and the iter-3
-re-opens of iter-2 critiques). The four Open Questions in §11
-(§11.3 heterogeneous batch params, §11.4 video inpainting, §11.7
-disable-vs-default sentinel) are intentional carry-outs flagged for
-follow-up designs, not unresolved iteration threads.
+**Converged on 2026-05-26 after 5 Codex iterations.** PR opened
+the same day; review feedback rounds tracked below.
+
+### PR review feedback
+
+| Round | Date       | Reviewer focus | Threads | Resolved | Open | Deferred |
+|-------|------------|-----------------|---------|----------|------|----------|
+| 1     | 2026-05-26 | Locked "Python is golden" default rule (§7.0); kept schemas split; added tensor-return formats (§7.6 — safetensors + pt); accept-and-warn OpenAI-shaped fields (model/quality/style); added width/height/num_frames/frame_rate-with-fps-alias; dropped `n` from video; simplified error envelope to LLM-serve shape with typed-subcode as alternative; dropped hint generator; dropped `VisualGenParams.mask` (dead code); folded `image_cond_strength` into video schema; reframed §5 + §11.1 as "fix, don't discuss options"; sharpened §5.5 docstring fix; confirmed `num_frames` I2V `+1` convention. | 22      | 22       | 0    | 0        |
+
+Open Questions still in §11 (intentional carry-outs, not unresolved
+review threads): §11.3 heterogeneous batch params, §11.7
+disable-vs-default sentinel.
 
 ---
