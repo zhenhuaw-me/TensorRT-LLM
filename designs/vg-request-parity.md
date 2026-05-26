@@ -1718,7 +1718,14 @@ later input.**
 | 2  | 2026-05-26 | forbid escape-hatch realism; hint catalogue drift vs `extra_param_specs`; null sentinel + silent-typo loophole; seed migration inventory breadth; executor error ownership / layering; mock-test race risk; §11.1 stale phrasing | 7       | 7        | 0    | 0        |
 | 3  | 2026-05-26 | FastAPI ordering for compat-mode escape hatch; null+default=None equivalence; §10 stale exception name; hint-lookup cache + no-generator fallback; distributed-seed correctness | 5       | 5        | 0    | 0        |
 | 4  | 2026-05-26 | Convergence pass: verified iter-3 resolutions; caught one stale §10.2 reference to pre-§10.4 pipeline-local seed logic | 5       | 5        | 0    | 0        |
+| 5  | 2026-05-26 | Final convergence check: verified the §10.2 fix landed and no third-place stale references remain. Codex returned "Convergence reached." | 0       | —        | 0    | 0        |
 
-(Iteration rows appended as Codex adversarial-review passes complete.)
+**Converged on 2026-05-26 after 5 iterations.** Total: 27 substantive
+threads raised across the loop, 27 resolved (including the iter-2
+re-opens of partially-addressed iter-1 critiques and the iter-3
+re-opens of iter-2 critiques). The four Open Questions in §11
+(§11.3 heterogeneous batch params, §11.4 video inpainting, §11.7
+disable-vs-default sentinel) are intentional carry-outs flagged for
+follow-up designs, not unresolved iteration threads.
 
 ---
