@@ -64,8 +64,11 @@ without silent typo bugs or per-model wire surprises.
 - **`ImageEditRequest` and `/v1/images/edits`** — the route returns
   501 Not Implemented today; the request type is acknowledged but
   not redesigned here.
-- **Output encoding** — base64 vs URL, MP4/AVI selection, FileResponse
-  vs JSON. Already settled.
+- **Output encoding for visual media (PNG/MP4 etc.)** — base64 vs URL,
+  MP4/AVI selection, FileResponse vs JSON. Already settled.
+  **Exception:** tensor-return encoding (`safetensors` / `pt`) and
+  the rename `output_format` → `format` for Python-HTTP alignment
+  ARE in scope — see §7.6, §10.
 - **Async video job lifecycle** — `/v1/videos` POST (async) +
   `GET/DELETE /v1/videos/{id}` and related endpoints stay as-is.
 - **Streaming intermediate frames** — Python side does not expose
@@ -371,13 +374,12 @@ Symbols: ✅ present, ❌ absent, ⚠️ present-with-divergence, ⤵️ promote
 | HTTP field without a `VisualGenParams` counterpart | Why it exists |
 | --- | --- |
 | `model` | OpenAI-compatibility (routes to the correct engine; ignored downstream when only one is loaded) |
-| `output_format` (image: `png`/`webp`/`jpeg`; video: `mp4`/`avi`/`auto`) | Encoding-side; out of scope |
+| `output_format` (image: `png`/`webp`/`jpeg`; video: `mp4`/`avi`/`auto`) | Generation content encoding format. Today's set covers PNG/MP4/etc; this design adds `safetensors`/`pt` (§7.6) and **renames the field to `format`** in the target schema to align with Python's `VisualGenOutput.save(format=...)` kwarg name. |
 | `quality` (image) | OpenAI compatibility; today mapped to `num_inference_steps=30` for `"hd"` (§5.4) |
-| `response_format` (image: `url`/`b64_json`) | Encoding-side; out of scope |
+| `response_format` (image: `url`/`b64_json`) | Transport-side (URL vs base64); orthogonal to `format` per §7.6 |
 | `style` (image: `vivid`/`natural`) | Accepted but unused (no pipeline reads it today) |
 | `user` (image) | Accepted but unused; OpenAI-shaped trace field |
 | `seconds`/`fps` (video) | OpenAI video-shape (used to compute `num_frames`) |
-| `output_format = "auto"` (video) | Server-side ffmpeg/encoder fallback |
 | `guidance_rescale` | Hardcoded → `extra_params["guidance_rescale"]`; per-model invalid (§5.3) |
 
 ### 4.1 Gap classification
@@ -734,7 +736,9 @@ class ImageGenerationRequest(OpenAIBaseModel):
     # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
     response_format: Literal["url", "b64_json"] = "url"
-    output_format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = "png"
+    # Generation content encoding format. Renamed from OpenAI's
+    # `output_format` to match Python `VisualGenOutput.save(format=...)`.
+    format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = "png"
     seed: Optional[int] = None
 
     # Resolution. `size` is OpenAI-shaped "WxH" string. width+height are an
@@ -787,7 +791,9 @@ class VideoGenerationRequest(OpenAIBaseModel):
     # Prompt + transport
     prompt: str
     response_format: Literal["url", "b64_json"] = "url"
-    output_format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = "auto"
+    # Generation content encoding format. Renamed from OpenAI's
+    # `output_format` to match Python `VisualGenOutput.save(format=...)`.
+    format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = "auto"
     seed: Optional[int] = None
     input_reference: Optional[Union[str, UploadFile]] = None
 
@@ -892,12 +898,23 @@ serve layer today encodes the visual tensor to PNG/MP4 before
 returning. Some workflows (programmatic post-processing, custom
 display pipelines, research integrations) want the raw tensor instead.
 
-The HTTP shape: extend `output_format` to include tensor formats.
-Transport composes orthogonally with the existing `response_format`
-(`url` writes a file and returns its URL; `b64_json` base64-encodes
-the serialized bytes inline). The conversion writes the
-`VisualGenOutput` tensors with the chosen serializer instead of
-running the PNG/MP4 encoder.
+The HTTP shape: extend the encoding-format field — renamed from
+OpenAI's `output_format` to `format` for parity with Python's
+`VisualGenOutput.save(format=...)` kwarg — to include tensor
+formats. Transport composes orthogonally with the existing
+`response_format` (`url` writes a file and returns its URL;
+`b64_json` base64-encodes the serialized bytes inline). The
+conversion writes the `VisualGenOutput` tensors with the chosen
+serializer instead of running the PNG/MP4 encoder.
+
+The Python `VisualGenOutput.save(format=...)` method
+(`tensorrt_llm/visual_gen/output.py:80`) is extended in lock-step to
+accept the same new tokens. The current signature accepts
+`'png'`/`'jpg'`/`'webp'`/`'mp4'`/`'avi'`; the redesign adds
+`'safetensors'` and `'pt'`. Python users and HTTP clients agree on
+the same vocabulary for "what format am I asking for," and the only
+difference is the destination (a `Path` for `save()`, a URL or a
+base64 body for HTTP).
 
 **Format comparison (multi-tensor support is the key axis since LTX-2
 returns video + audio + frame_rate metadata together):**
@@ -937,18 +954,18 @@ output with named parts" use case here.
 **Recommendation: support both `safetensors` and `pt`; default to
 `safetensors`.**
 
-- **`output_format="safetensors"`** is the default tensor option. No
+- **`format="safetensors"`** is the default tensor option. No
   pickle on load; the file is fully self-describing; ecosystem
   familiarity (safetensors is the default for HF models, which all
   VisualGen pipelines already pull). Server uses
   `safetensors.torch.save(tensors, metadata={...})`; client loads
   with `safetensors.torch.load(bytes)` or the file-based variant.
-- **`output_format="pt"`** is the opt-in PyTorch-native path for
-  workflows that already use `torch.load`. Server uses `torch.save`;
-  client loads with `torch.load(buf, weights_only=True)` (safe path
-  in PyTorch 2.4+). Documented as "PyTorch ≥ 2.4 recommended for
-  safe load."
-- **`output_format` does not include `npz`.** Rationale: it offers no
+- **`format="pt"`** is the opt-in PyTorch-native path for workflows
+  that already use `torch.load`. Server uses `torch.save`; client
+  loads with `torch.load(buf, weights_only=True)` (safe path in
+  PyTorch 2.4+). Documented as "PyTorch ≥ 2.4 recommended for safe
+  load."
+- **`format` does not include `npz`.** Rationale: it offers no
   property the other two don't, has a less natural multi-tensor
   shape, and adds a third surface to test. If a strong NumPy-only
   client appears later, adding it is a one-field schema change plus
@@ -958,7 +975,7 @@ The two formats share the same `response_format` transport: `url`
 mode writes the bytes to `media_storage_path / "<id>.<ext>"` and
 returns its URL; `b64_json` mode base64-encodes the bytes into the
 response body. The conversion picks the extension and serializer
-based on `output_format` and the modality of `VisualGenOutput`.
+based on `format` and the modality of `VisualGenOutput`.
 
 **Why not just one format?** The user-survey signal is that PyTorch
 users overwhelmingly reach for `torch.load`, and forcing them through
@@ -1069,8 +1086,8 @@ holds today's base64-decode-and-write-to-disk logic from
 `visual_gen_utils.py:60-70`. `_warn_if_set_with_no_semantic` walks
 the per-§7.7 list and logs a WARNING when fields like `quality` or
 `style` have a non-None value; for `model` it also checks for
-mismatch with the loaded model id. `output_format` is consumed by
-the response-building path in `openai_server.py`, not by
+mismatch with the loaded model id. `format` is consumed by the
+response-building path in `openai_server.py`, not by
 `parse_visual_gen_params`, since it controls encoding rather than
 engine params — see §7.6.)
 
@@ -1351,7 +1368,8 @@ Coordinated PR (or short series) touching:
 
 | File | Change |
 | --- | --- |
-| `tensorrt_llm/serve/openai_protocol.py` | Rewrite `ImageGenerationRequest` and `VideoGenerationRequest` per §7.1/§7.2. Add `extra_params`, `max_sequence_length`, `width`/`height`, `num_frames`, `frame_rate` (with `fps` alias). Drop top-level `guidance_rescale` and `n` (video). Keep `model`/`quality`/`style`/`user` as accept-and-warn (§7.7). Extend `output_format` to include `"safetensors"` and `"pt"` (§7.6). |
+| `tensorrt_llm/serve/openai_protocol.py` | Rewrite `ImageGenerationRequest` and `VideoGenerationRequest` per §7.1/§7.2. Add `extra_params`, `max_sequence_length`, `width`/`height`, `num_frames`, `frame_rate` (with `fps` alias). Drop top-level `guidance_rescale` and `n` (video). Keep `model`/`quality`/`style`/`user` as accept-and-warn (§7.7). **Rename `output_format` → `format`** (matches Python `VisualGenOutput.save(format=...)`) and extend the literal set to include `"safetensors"` and `"pt"` (§7.6). |
+| `tensorrt_llm/visual_gen/output.py` | Extend `VisualGenOutput.save(format=...)` to accept `"safetensors"` and `"pt"` alongside today's `"png"`/`"jpg"`/`"webp"`/`"mp4"`/`"avi"` (§7.6). Add the corresponding write paths in `tensorrt_llm/media/encoding.py` (or co-located helper) using `safetensors.torch.save_file` / `torch.save`. |
 | `tensorrt_llm/serve/visual_gen_utils.py` | Rewrite `parse_visual_gen_params` per §8. Add `_warn_if_set_with_no_semantic` for accept-and-warn fields, `_merge_extra_params` per §8.3, and tensor-format serializers per §7.6. Drop the `mask` write path (the field is being removed from `VisualGenParams`). |
 | `tensorrt_llm/serve/openai_video_routes.py` | Wire `VisualGenValidationError → create_error_response` per §9.1's chosen option. Add tensor-format response path (write `.safetensors`/`.pt` bytes via `media_storage_path` for `response_format="url"`, base64-encode for `b64_json`). |
 | `tensorrt_llm/serve/openai_server.py` | Same for the image endpoint. |
@@ -1361,7 +1379,7 @@ Coordinated PR (or short series) touching:
 | `tests/unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py` | Extend (§10.1). Already mocks `VisualGen` via `MockVisualGen` and uses FastAPI's `TestClient` — no GPU required. |
 | `tests/unittest/_torch/visual_gen/test_visual_gen_params.py` | Add a regression for `seed=None`; update existing case that relied on `42`. Remove the `mask` default assertion. |
 | `examples/visual_gen/serve/README.md` | Update parameter list: note `quality`/`style`/`model` are accept-and-warn; document `extra_params` with per-model accepted keys; document tensor return formats. |
-| `docs/source/models/visual-generation.md` (and related) | Document the per-model `extra_params` accepted keys and the new tensor-return `output_format` values. Defer to a follow-up doc PR if structure isn't settled. |
+| `docs/source/models/visual-generation.md` (and related) | Document the per-model `extra_params` accepted keys and the new tensor-return `format` values (and the rename from `output_format`). Defer to a follow-up doc PR if structure isn't settled. |
 
 ### 10.1 Test plan (HTTP unit + integration split)
 
@@ -1383,9 +1401,9 @@ obvious and capture-point issues are avoided:
   fields → 422; mismatched types/regex → 422; `width`/`height`
   paired-or-error validator → 422 when only one is sent; schema
   acceptance for every preserved field on both image and video
-  request models. Tensor `output_format` values (`safetensors`,
-  `pt`) → 200 with the right `Content-Type` (under `response_format=url`)
-  or the right base64 prefix (under `b64_json`).
+  request models. Tensor `format` values (`safetensors`, `pt`) →
+  200 with the right `Content-Type` (under `response_format=url`) or
+  the right base64 prefix (under `b64_json`).
 - **Conversion tests** (a new `test_visual_gen_utils.py` or extension
   of an existing file): call `parse_visual_gen_params(...)` and
   `_merge_extra_params(...)` directly with constructed Pydantic
@@ -1551,14 +1569,36 @@ mechanism is named in its own §5.* sub-section.
 
 ### 11.3 Heterogeneous batch params (`n > 1` with per-sample overrides)
 
-Python `generate_async` explicitly does not accept
-`List[VisualGenParams]` (`visual_gen.py:852-855`). HTTP `n > 1`
-multiplexes by repeating the same `params` N times. There's no
-shape for "give me 4 samples with 4 different seeds".
+**Today's `n` semantics** (image only, since `n` is dropped from
+video per §7.2): the HTTP `n` field maps to
+`VisualGenParams.num_images_per_prompt = n`, which becomes the
+internal `batch_size` inside each pipeline's `forward()` call. The
+seed handling is best illustrated by Flux
+(`tensorrt_llm/_torch/visual_gen/models/flux/pipeline_flux.py:296`):
 
-Out of scope here. When/if Python gains per-item support, the HTTP
-side likely grows a `seeds: Optional[List[int]] = None` or similar
-sibling. Not designing that today.
+```python
+generator = torch.Generator(device=self.device).manual_seed(seed)
+# ...
+latents, latent_ids = self._prepare_latents(
+    batch_size, height, width, generator,
+)
+```
+
+A single `torch.Generator` is seeded once with the request's seed,
+then used to sample latents for all `batch_size` items. Each of the
+N images gets *different* random latents (the generator advances
+between draws), but they're all derived deterministically from the
+single input seed. No client-controllable per-image seed override
+exists today — the constraint is "one seed in, N deterministic
+samples out, each different from the others."
+
+**What's still open** is the cross-design extension: if/when Python
+`generate_async` gains per-item `List[VisualGenParams]` support
+(`visual_gen.py:852-855` raises `NotImplementedError` for that path
+today), the HTTP side likely grows a `seeds: Optional[List[int]] = None`
+sibling field, or `extra_params.per_sample_overrides`, or similar.
+Not designing that today; flagged for a follow-up when the Python
+API decision lands.
 
 ### 11.4 ~~Video inpainting via `mask`~~ *Closed: `VisualGenParams.mask` is being dropped (no pipeline consumes it). `image_cond_strength` is general.*
 
@@ -1581,23 +1621,17 @@ the video schema in §7.2.
 
 ### 11.6 ~~Validation message format for `extra_params` errors~~ *Resolved: §9.1 defines the JSON error envelope.*
 
-### 11.7 Explicit `None` override for `extra_params` keys whose "disabled" state is distinct from "use default"
+### 11.7 ~~Explicit `None` override for `extra_params` keys whose "disabled" state is distinct from "use default"~~ *Closed.*
 
-The §8.3 merge rule treats `null` on a known `extra_params` key as
-"use pipeline default." For most keys this is correct, but a small
-category — list-valued knobs like `stg_blocks` whose `None` is a
-*meaningful disable* rather than just absence — can't currently
-distinguish "client wants the disabled state explicitly" from
-"client doesn't care, use default." Both routes produce
-`params.extra_params[key] = <default>` and the spec's default may
-itself be `None`.
-
-This is an intentional limitation; an explicit disable-vs-default
-distinction would expand the HTTP shape beyond what diffusion
-clients ask for today. If a real use case appears, two options:
-(a) add a sentinel string like `"__disabled__"` for that key; or
-(b) document per-key semantics in the model's docs. **Open for
-later input.**
+Not a concern in practice. The pipeline owns the semantics of each
+`extra_params` key it accepts — if a pipeline needs to distinguish
+"explicit disable" from "use default," it can encode that in its own
+key handling. The HTTP shape doesn't need a dedicated sentinel for
+this edge case. The current `extra_params` surface is also not
+well-maintained at the per-model spec level today, so this design
+deliberately keeps the focus on the general (universal) request
+params and leaves model-specific knob ergonomics to the model's own
+documentation.
 
 ---
 
@@ -1618,7 +1652,8 @@ the same day; review feedback rounds tracked below.
 
 | Round | Date       | Reviewer focus | Threads | Resolved | Open | Deferred |
 |-------|------------|-----------------|---------|----------|------|----------|
-| 1     | 2026-05-26 | Locked "Python is golden" default rule (§7.0); kept schemas split; added tensor-return formats (§7.6 — safetensors + pt); accept-and-warn OpenAI-shaped fields (model/quality/style); added width/height/num_frames/frame_rate-with-fps-alias; dropped `n` from video; simplified error envelope to LLM-serve shape with typed-subcode as alternative; dropped hint generator; dropped `VisualGenParams.mask` (dead code); folded `image_cond_strength` into video schema; reframed §5 + §11.1 as "fix, don't discuss options"; sharpened §5.5 docstring fix; confirmed `num_frames` I2V `+1` convention. | 22      | 22       | 0    | 0        |
+| 1     | 2026-05-26 | Locked "Python is golden" default rule (§7.0); kept schemas split; added tensor-return formats (§7.6 — safetensors + pt); accept-and-warn OpenAI-shaped fields (model/quality/style); added width/height/num_frames/frame_rate-with-fps-alias; dropped `n` from video; simplified error envelope to LLM-serve shape with typed-subcode as alternative; dropped hint generator; dropped `VisualGenParams.mask` (dead code); folded `image_cond_strength` into video schema; reframed §5 + §11.1 as "fix, don't discuss options"; sharpened §5.5 docstring fix; confirmed `num_frames` I2V `+1` convention. | 22      | 19       | 3    | 0        |
+| 2     | 2026-05-27 | Renamed HTTP `output_format` → `format` to match Python `VisualGenOutput.save(format=...)`; extended Python `save()` to accept `safetensors`/`pt`; un-scoped tensor-return from "out of scope" framing; deleted duplicate `output_format` row in §4; clarified §11.3 `n` semantics (single seed → N different-latent images via shared `torch.Generator`); closed §11.7 (pipelines own per-key semantics; design focuses on general params). | 6       | 6        | 0    | 0        |
 
 Open Questions still in §11 (intentional carry-outs, not unresolved
 review threads): §11.3 heterogeneous batch params, §11.7
