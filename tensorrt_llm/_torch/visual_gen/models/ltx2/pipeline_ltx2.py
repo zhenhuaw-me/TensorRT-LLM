@@ -1253,7 +1253,6 @@ class LTX2Pipeline(BasePipeline):
             "max_sequence_length": 1024,
             "num_frames": 121,
             "frame_rate": 24.0,
-            "image_cond_strength": 1.0,
         }
 
     @property
@@ -1268,6 +1267,11 @@ class LTX2Pipeline(BasePipeline):
                 type="float",
                 default=0.0,
                 description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "image_cond_strength": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Image conditioning strength for I2V (1.0 = fully conditioned first frame).",
             ),
             "stg_scale": ExtraParamSchema(
                 type="float",
@@ -1318,7 +1322,7 @@ class LTX2Pipeline(BasePipeline):
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
             image=req.params.image,
-            image_cond_strength=req.params.image_cond_strength,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -1370,6 +1374,7 @@ class LTX2Pipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -1378,8 +1383,6 @@ class LTX2Pipeline(BasePipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
-        *,
-        seed: int,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,

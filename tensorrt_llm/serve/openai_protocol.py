@@ -46,6 +46,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.visual_gen.params import MAX_UINT32_SEED
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -1347,6 +1348,8 @@ class ImageGenerationRequest(OpenAIBaseModel):
             "``safetensors``/``pt`` for programmatic post-processing."),
     )
     seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                le=MAX_UINT32_SEED,
                                 description="Random seed for reproducibility.")
 
     # Resolution. ``size`` is OpenAI-shaped; ``width`` + ``height`` are an
@@ -1460,6 +1463,8 @@ class ImageEditRequest(OpenAIBaseModel):
         default=None,
         description="Text describing what to avoid in the edited image.")
     seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                le=MAX_UINT32_SEED,
                                 description="Random seed for reproducibility.")
 
     @field_validator("size")
@@ -1493,6 +1498,8 @@ class VideoGenerationRequest(OpenAIBaseModel):
             "metadata (frame rate, audio sample rate) in one payload."),
     )
     seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                le=MAX_UINT32_SEED,
                                 description="Random seed for reproducibility.")
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
@@ -1529,7 +1536,6 @@ class VideoGenerationRequest(OpenAIBaseModel):
     guidance_scale: Optional[float] = Field(default=None, gt=0)
     max_sequence_length: Optional[int] = Field(default=None, gt=0)
     negative_prompt: Optional[str] = None
-    image_cond_strength: Optional[float] = None
 
     # Model-specific overflow
     extra_params: Optional[Dict[str, Any]] = Field(

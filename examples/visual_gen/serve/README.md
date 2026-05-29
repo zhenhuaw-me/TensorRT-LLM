@@ -283,7 +283,7 @@ You can customize these by:
 - `seconds`: Duration in seconds (engine multiplies by `frame_rate` to derive `num_frames` when the latter is absent)
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
-- `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`, `image_cond_strength`: per-request denoise controls
+- `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
 - `input_reference`: Reference image (TI2V mode); accepted as base64-encoded string in JSON or as a file in multipart form-data
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`

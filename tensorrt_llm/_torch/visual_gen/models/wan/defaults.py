@@ -110,7 +110,6 @@ def get_wan_default_params(
     num_heads: int,
     *,
     is_wan22_5b: bool = False,
-    include_i2v: bool = False,
 ) -> dict:
     """Return the default generation params dict for a Wan model.
 
@@ -119,15 +118,7 @@ def get_wan_default_params(
         name_or_path: Checkpoint path or HF model ID (_name_or_path).
         num_heads: Number of attention heads from transformer config.
         is_wan22_5b: Whether this is a Wan 2.2 TI2V-5B model.
-        include_i2v: Retained for call-site symmetry with the T2V /
-            I2V split; Wan pipelines do not implement
-            ``image_cond_strength`` so the parameter intentionally
-            does not appear in the returned dict. The strict
-            validator therefore rejects ``image_cond_strength`` on
-            every Wan pipeline.
     """
-    del include_i2v  # Wan pipelines don't consume image_cond_strength.
-
     if is_wan22_5b:
         params = dict(_WAN22_5B_PARAMS)
     elif is_wan22_14b:

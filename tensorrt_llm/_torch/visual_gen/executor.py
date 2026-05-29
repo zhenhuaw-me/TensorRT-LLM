@@ -78,10 +78,8 @@ _TYPE_MAP = {
 # Generation config fields that pipelines declare defaults for.
 # If a user sets one of these but the pipeline doesn't declare it in
 # default_generation_params, the request is rejected so unsupported
-# knobs don't get silently dropped (e.g. ``image_cond_strength`` on
-# Wan-T2V, which would otherwise be a top-level field that no
-# pipeline code reads). Conditioning inputs ``image`` and
-# ``negative_prompt`` are still validated at runtime by the pipeline's
+# knobs don't get silently dropped. Conditioning inputs ``image`` and
+# ``negative_prompt`` are validated at runtime by the pipeline's
 # ``infer()`` and stay out of this set.
 _GENERATION_CONFIG_FIELDS: tuple[str, ...] = (
     "height",
@@ -91,7 +89,6 @@ _GENERATION_CONFIG_FIELDS: tuple[str, ...] = (
     "max_sequence_length",
     "num_frames",
     "frame_rate",
-    "image_cond_strength",
 )
 
 
@@ -131,8 +128,8 @@ def validate_visual_gen_params(
     # --- unsupported universal fields ---
     # Check generation config fields the user explicitly set (not None)
     # that the pipeline never declared in declared_defaults.
-    # Conditioning inputs (image, negative_prompt, image_cond_strength)
-    # are excluded — they are validated at runtime by the pipeline's infer().
+    # Conditioning inputs (image, negative_prompt) are excluded — they
+    # are validated at runtime by the pipeline's infer().
     if declared_defaults is not None:
         for field_name in _GENERATION_CONFIG_FIELDS:
             value = getattr(params, field_name, None)
@@ -322,7 +319,9 @@ class DiffusionExecutor:
 
             req.params = VisualGenParams()
         if req.params.seed is None:
-            req.params.seed = secrets.randbits(63)
+            # 32-bit range matches the OpenAI DALL-E seed convention that
+            # vllm-omni adopts; see VisualGenParams.seed for context.
+            req.params.seed = secrets.randbits(32)
 
     def _merge_defaults(self, req: DiffusionRequest):
         """Fill ``None`` fields in *req.params* with pipeline-specific defaults.

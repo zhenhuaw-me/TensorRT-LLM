@@ -18,6 +18,13 @@ from pydantic import Field
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
+# Match the OpenAI DALL-E API range that vllm-omni adopts for seed
+# (see https://github.com/vllm-project/vllm-omni — api_server.py clamps
+# user-supplied seeds to MAX_UINT32_SEED before dispatch). Engine-side
+# random seed generation also stays in this range so reproducibility
+# transports cleanly between client and server.
+MAX_UINT32_SEED = 2**32 - 1
+
 
 @set_api_status("prototype")
 class VisualGenParams(StrictBaseModel):
@@ -46,11 +53,22 @@ class VisualGenParams(StrictBaseModel):
     max_sequence_length: Optional[int] = Field(
         default=None, description="Max tokens for text encoding."
     )
+    # When ``num_images_per_prompt > 1`` is honored end-to-end (future),
+    # the implementation follows the diffusers/vllm-omni convention:
+    # one ``torch.Generator(seed=s)`` drives ``N`` latents from a single
+    # RNG stream (batched ``randn``), not SGLang's per-image
+    # ``[s, s+1, …]`` expansion. Adding ``seed: int | list[int]`` is
+    # left as an additive extension if explicit per-image seeds become
+    # a requirement.
     seed: Optional[int] = Field(
         default=None,
+        ge=0,
+        le=MAX_UINT32_SEED,
         description=(
             "Random seed for reproducibility. ``None`` means the engine draws "
-            "a fresh seed on the coordinator rank before pipeline dispatch."
+            "a fresh seed on the coordinator rank before pipeline dispatch. "
+            f"Must be in ``[0, {MAX_UINT32_SEED}]`` for compatibility with the "
+            "OpenAI DALL-E API seed range."
         ),
     )
 
@@ -64,9 +82,6 @@ class VisualGenParams(StrictBaseModel):
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
-    )
-    image_cond_strength: Optional[float] = Field(
-        default=None, description="Image conditioning strength."
     )
 
     # Per-prompt multiplier

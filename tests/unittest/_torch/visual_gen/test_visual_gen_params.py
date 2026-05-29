@@ -53,7 +53,9 @@ class TestVisualGenParamsValidation:
         assert params.frame_rate is None
         assert params.negative_prompt is None
         assert params.image is None
-        assert params.image_cond_strength is None
+        # ``image_cond_strength`` moved to per-pipeline ``extra_params``
+        # (only LTX-2 consumes it). It is no longer a top-level field.
+        assert not hasattr(params, "image_cond_strength")
         # `seed` is now ``Optional[int]`` and defaults to None — the engine
         # draws a fresh value on the coordinator rank before broadcast.
         assert params.seed is None
@@ -127,6 +129,30 @@ class TestVisualGenParamsValidation:
 
         params = VisualGenParams(negative_prompt="blurry, low quality")
         assert params.negative_prompt == "blurry, low quality"
+
+    def test_seed_accepts_range_bounds(self):
+        from tensorrt_llm.visual_gen import VisualGenParams
+        from tensorrt_llm.visual_gen.params import MAX_UINT32_SEED
+
+        assert VisualGenParams(seed=0).seed == 0
+        assert VisualGenParams(seed=MAX_UINT32_SEED).seed == MAX_UINT32_SEED
+
+    def test_seed_rejects_negative(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        with pytest.raises(ValidationError):
+            VisualGenParams(seed=-1)
+
+    def test_seed_rejects_above_max_uint32(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import VisualGenParams
+        from tensorrt_llm.visual_gen.params import MAX_UINT32_SEED
+
+        with pytest.raises(ValidationError):
+            VisualGenParams(seed=MAX_UINT32_SEED + 1)
 
 
 # =============================================================================
@@ -288,6 +314,7 @@ class TestPipelineExtraParamSpecs:
         expected_keys = {
             "output_type",
             "guidance_rescale",
+            "image_cond_strength",
             "stg_scale",
             "stg_blocks",
             "modality_scale",
@@ -751,43 +778,25 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match="frame_rate.*not accept it"):
             self._validate(executor, req)
 
-    def test_image_cond_strength_on_t2v_pipeline_raises(self):
-        """``image_cond_strength`` on a Wan T2V (no I2V conditioning)
-        pipeline must be rejected — the pipeline never reads the
-        value, so silently dropping it would defeat the strict
-        request policy."""
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
-
-        executor = self._make_mock_executor(WanPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image_cond_strength=0.8)
-        with pytest.raises(ValueError, match="image_cond_strength.*not accept it"):
-            self._validate(executor, req)
-
-    def test_image_cond_strength_on_wan_i2v_pipeline_raises(self):
-        """``image_cond_strength`` is not consumed by Wan I2V's
-        ``forward()`` today — declaring it in defaults would be a
-        silent no-op. The strict validator rejects it on every Wan
-        variant so the wire contract matches the pipeline's actual
-        behavior."""
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
-            WanImageToVideoPipeline,
-        )
-
-        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image_cond_strength=0.6)
-        with pytest.raises(ValueError, match="image_cond_strength.*not accept it"):
-            self._validate(executor, req)
-
-    def test_image_cond_strength_on_ltx2_pipeline_ok(self):
-        """LTX-2 threads ``image_cond_strength`` through
-        ``infer`` → ``forward``; the field must not raise on a
-        pipeline that actually consumes it."""
+    def test_image_cond_strength_on_ltx2_extra_params_ok(self):
+        """LTX-2 declares ``image_cond_strength`` in extra_param_specs;
+        passing it via ``extra_params`` must validate successfully."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         executor = self._make_mock_executor(LTX2Pipeline)
-        req = self._make_request(image_cond_strength=0.6)
-        # Should not raise — declared and consumed by LTX-2.
-        self._merge_and_validate(executor, req)
+        req = self._make_request(extra_params={"image_cond_strength": 0.6})
+        self._merge_and_validate(executor, req)  # should not raise
+
+    def test_image_cond_strength_on_wan_via_extra_params_raises(self):
+        """Wan pipelines do not declare ``image_cond_strength`` in
+        their extra_param_specs, so passing it via ``extra_params``
+        must be rejected as an unknown key."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(num_heads=12))
+        req = self._make_request(extra_params={"image_cond_strength": 0.8})
+        with pytest.raises(ValueError, match="Unknown extra_params"):
+            self._validate(executor, req)
 
     def test_image_not_checked_by_validator(self):
         """image is a conditioning input — validated at runtime by infer(), not here."""

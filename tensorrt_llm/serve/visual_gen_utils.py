@@ -137,8 +137,6 @@ def parse_visual_gen_params(
             params.num_images_per_prompt = request.n
 
     elif isinstance(request, VideoGenerationRequest):
-        if request.image_cond_strength is not None:
-            params.image_cond_strength = request.image_cond_strength
         if request.frame_rate is not None:
             params.frame_rate = request.frame_rate
         # num_frames wins; otherwise derive from seconds * frame_rate

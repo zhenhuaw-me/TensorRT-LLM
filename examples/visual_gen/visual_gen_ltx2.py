@@ -416,6 +416,7 @@ def main():
 
         extra_params = {
             "guidance_rescale": args.guidance_rescale,
+            "image_cond_strength": args.image_cond_strength,
             "stg_scale": args.stg_scale,
             "modality_scale": args.modality_scale,
             "rescale_scale": args.rescale_scale,
@@ -436,7 +437,6 @@ def main():
             frame_rate=args.frame_rate,
             negative_prompt=args.negative_prompt,
             image=args.image,
-            image_cond_strength=args.image_cond_strength,
             extra_params=extra_params,
         )
 

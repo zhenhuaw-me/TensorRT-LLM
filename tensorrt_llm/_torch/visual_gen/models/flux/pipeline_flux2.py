@@ -354,12 +354,11 @@ class Flux2Pipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
-        *,
-        seed: int,
         max_sequence_length: int = 512,
     ):
         """Generate image(s) from text prompt(s).
