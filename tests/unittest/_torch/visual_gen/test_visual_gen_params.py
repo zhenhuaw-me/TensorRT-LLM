@@ -740,7 +740,7 @@ class TestRequestValidation:
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(num_frames=81)
-        with pytest.raises(ValueError, match="num_frames.*not use it"):
+        with pytest.raises(ValueError, match="num_frames.*not accept it"):
             self._validate(executor, req)
 
     def test_frame_rate_on_image_pipeline_raises(self):
@@ -748,7 +748,7 @@ class TestRequestValidation:
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(frame_rate=24.0)
-        with pytest.raises(ValueError, match="frame_rate.*not use it"):
+        with pytest.raises(ValueError, match="frame_rate.*not accept it"):
             self._validate(executor, req)
 
     def test_image_cond_strength_on_t2v_pipeline_raises(self):
@@ -760,7 +760,7 @@ class TestRequestValidation:
 
         executor = self._make_mock_executor(WanPipeline, _wan_mock(num_heads=12))
         req = self._make_request(image_cond_strength=0.8)
-        with pytest.raises(ValueError, match="image_cond_strength.*not use it"):
+        with pytest.raises(ValueError, match="image_cond_strength.*not accept it"):
             self._validate(executor, req)
 
     def test_image_cond_strength_on_wan_i2v_pipeline_raises(self):
@@ -775,7 +775,7 @@ class TestRequestValidation:
 
         executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
         req = self._make_request(image_cond_strength=0.6)
-        with pytest.raises(ValueError, match="image_cond_strength.*not use it"):
+        with pytest.raises(ValueError, match="image_cond_strength.*not accept it"):
             self._validate(executor, req)
 
     def test_image_cond_strength_on_ltx2_pipeline_ok(self):
@@ -991,14 +991,14 @@ class TestRequestValidation:
 
 
 # =============================================================================
-# VisualGenValidationError — structured exception fields
+# Parameter validation — message content per category
 # =============================================================================
 
 
-class TestVisualGenValidationErrorStructured:
-    """The executor surfaces structured ``reason``/``param``/``details`` on
-    every category of parameter violation. Keeps the contract green even if
-    the human-readable messages drift."""
+class TestValidateVisualGenParamsMessages:
+    """``validate_visual_gen_params`` raises ``ValueError`` with a multi-line
+    message naming every offending field so callers (and HTTP clients) can
+    fix the request without parsing a structured envelope."""
 
     def _make_mock_executor(self, pipeline_cls, mock_self=None):
         executor = MagicMock()
@@ -1021,101 +1021,55 @@ class TestVisualGenValidationErrorStructured:
 
         DiffusionExecutor._validate_request(executor, req)
 
-    def test_subclasses_value_error(self):
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
-
-        exc = VisualGenValidationError("unknown_extra_param", "k", "msg", {"a": 1})
-        assert isinstance(exc, ValueError)
-        # ``str(exc)`` is the human message so existing ``except ValueError``
-        # log lines and ``pytest.raises(ValueError, match=...)`` checks see
-        # the same string as before.
-        assert str(exc) == "msg"
-        assert exc.message == "msg"
-        assert exc.reason == "unknown_extra_param"
-        assert exc.param == "k"
-        assert exc.details == {"a": 1}
-
-    def test_reasons_tuple_matches_design(self):
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
-
-        assert set(VisualGenValidationError.REASONS) == {
-            "unknown_extra_param",
-            "unsupported_universal_field",
-            "extra_param_type_mismatch",
-            "extra_param_out_of_range",
-        }
-
-    def test_unknown_extra_param_fields(self):
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
+    def test_unknown_extra_param_message(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         executor = self._make_mock_executor(LTX2Pipeline)
         req = self._make_request(extra_params={"stg_sclae": 1.0, "bogus_key": 2})
-        with pytest.raises(VisualGenValidationError) as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             self._validate(executor, req)
-        exc = excinfo.value
-        assert exc.reason == "unknown_extra_param"
-        # `param` is the first offending key in sorted order.
-        assert exc.param == "bogus_key"
-        assert exc.details["pipeline"] == "LTX2Pipeline"
-        assert sorted(exc.details["unknown_extra_param"]["keys"]) == ["bogus_key", "stg_sclae"]
-        assert "supported" in exc.details["unknown_extra_param"]
+        msg = str(excinfo.value)
+        assert "LTX2Pipeline" in msg
+        assert "Unknown extra_params" in msg
+        assert "bogus_key" in msg and "stg_sclae" in msg
 
-    def test_unsupported_universal_field_fields(self):
-        """An image pipeline should reject video-only universal fields with a
-        deterministic ``param`` (the first unsupported field by declared
-        iteration order)."""
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
+    def test_unsupported_universal_field_message(self):
+        """An image pipeline should reject video-only universal fields and
+        name every offending field in the message."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
         executor = self._make_mock_executor(FluxPipeline)
-        # FluxPipeline doesn't declare num_frames or frame_rate; both should
-        # be flagged with the iteration-order-first key as ``param``.
         req = self._make_request(num_frames=81, frame_rate=24.0)
-        with pytest.raises(VisualGenValidationError) as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             self._validate(executor, req)
-        exc = excinfo.value
-        assert exc.reason == "unsupported_universal_field"
-        # ``_GENERATION_CONFIG_FIELDS`` declares num_frames before
-        # frame_rate, so param is deterministic.
-        assert exc.param == "num_frames"
-        assert exc.details["unsupported_universal_field"]["fields"] == ["num_frames", "frame_rate"]
+        msg = str(excinfo.value)
+        assert "num_frames" in msg
+        assert "frame_rate" in msg
+        assert "FluxPipeline" in msg
 
-    def test_extra_param_type_mismatch_fields(self):
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
+    def test_extra_param_type_mismatch_message(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         executor = self._make_mock_executor(LTX2Pipeline)
-        # stg_scale is declared as ``float``; passing a string triggers a
-        # type mismatch.
         req = self._make_request(extra_params={"stg_scale": "fast"})
-        with pytest.raises(VisualGenValidationError) as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             self._validate(executor, req)
-        exc = excinfo.value
-        assert exc.reason == "extra_param_type_mismatch"
-        assert exc.param == "stg_scale"
-        mismatch = exc.details["extra_param_type_mismatch"][0]
-        assert mismatch["key"] == "stg_scale"
-        assert mismatch["expected_type"] == "float"
-        assert mismatch["got_type"] == "str"
-        assert mismatch["value"] == "fast"
+        msg = str(excinfo.value)
+        assert "stg_scale" in msg
+        assert "expected type 'float'" in msg
+        assert "got str" in msg
 
-    def test_extra_param_out_of_range_fields(self):
-        from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
+    def test_extra_param_out_of_range_message(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
         executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22_14b=True, num_heads=12))
-        # boundary_ratio is declared with range [0.0, 1.0].
         req = self._make_request(extra_params={"boundary_ratio": -0.5})
-        with pytest.raises(VisualGenValidationError) as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             self._validate(executor, req)
-        exc = excinfo.value
-        assert exc.reason == "extra_param_out_of_range"
-        assert exc.param == "boundary_ratio"
-        violation = exc.details["extra_param_out_of_range"][0]
-        assert violation["key"] == "boundary_ratio"
-        assert violation["value"] == -0.5
-        assert violation["range"] == [0.0, 1.0]
+        msg = str(excinfo.value)
+        assert "boundary_ratio" in msg
+        assert "-0.5" in msg
+        assert "[0.0, 1.0]" in msg
 
 
 # =============================================================================
@@ -1187,11 +1141,11 @@ class TestResolveSeed:
 
 
 class TestValidationErrorTransport:
-    """When ``_validate_request`` raises ``VisualGenValidationError``,
-    ``process_request`` must put a ``DiffusionResponse`` carrying the
-    structured ``error_reason``/``error_param``/``error_details`` so the
-    serve layer can recover the engine-side context without parsing the
-    message string."""
+    """``process_request`` tags the ``DiffusionResponse`` with
+    ``is_validation_error`` so the coordinator-side awaiter knows whether to
+    re-raise as ``ValueError`` (validation, → HTTP 400) or ``RuntimeError``
+    (engine, → HTTP 500). Both paths carry the human-readable message on
+    ``error_msg``."""
 
     def _make_executor(self, pipeline_cls, mock_self=None):
         executor = MagicMock()
@@ -1206,7 +1160,7 @@ class TestValidationErrorTransport:
         executor.pipeline.extra_param_specs = pipeline_cls.extra_param_specs.fget(mock_self)
         return executor
 
-    def test_validation_error_populates_structured_response_fields(self):
+    def test_validation_error_tags_response(self):
         from tensorrt_llm._torch.visual_gen.executor import (
             DiffusionExecutor,
             DiffusionRequest,
@@ -1233,12 +1187,10 @@ class TestValidationErrorTransport:
         resp = executor.response_queue.put.call_args[0][0]
         assert isinstance(resp, DiffusionResponse)
         assert resp.error_msg is not None
-        assert resp.error_reason == "unknown_extra_param"
-        assert resp.error_param == "unknown_key"
-        assert resp.error_details is not None
-        assert resp.error_details["pipeline"] == "LTX2Pipeline"
+        assert "unknown_key" in resp.error_msg
+        assert resp.is_validation_error is True
 
-    def test_non_validation_error_leaves_structured_fields_none(self):
+    def test_non_validation_error_leaves_flag_false(self):
         from tensorrt_llm._torch.visual_gen.executor import (
             DiffusionExecutor,
             DiffusionRequest,
@@ -1253,8 +1205,7 @@ class TestValidationErrorTransport:
         executor._validate_request = lambda req: DiffusionExecutor._validate_request(executor, req)
         executor.pipeline.warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.pipeline._warmed_up_shapes = None
-        # Force a generic failure inside infer() — must NOT populate
-        # structured fields.
+        # Force a generic engine-side failure — flag must stay False.
         executor.pipeline.infer = MagicMock(side_effect=RuntimeError("oops"))
 
         req = DiffusionRequest(
@@ -1269,6 +1220,4 @@ class TestValidationErrorTransport:
         resp = executor.response_queue.put.call_args[0][0]
         assert isinstance(resp, DiffusionResponse)
         assert resp.error_msg == "oops"
-        assert resp.error_reason is None
-        assert resp.error_param is None
-        assert resp.error_details is None
+        assert resp.is_validation_error is False

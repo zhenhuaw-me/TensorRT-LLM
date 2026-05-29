@@ -24,7 +24,6 @@ from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
@@ -171,17 +170,11 @@ class _VideoRoutesMixin:
                 headers=headers,
             )
 
-        except VisualGenValidationError as exc:
-            logger.error(f"Video validation error: {exc.message}")
-            return self.create_error_response(
-                message=exc.message,
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
         except ValidationError as exc:
             return self._render_pydantic_validation_error(exc)
         except ValueError as e:
-            logger.error(f"Request parsing error: {e}")
-            return self.create_error_response(str(e))
+            logger.error(f"Video request error: {e}")
+            return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(
@@ -299,7 +292,14 @@ class _VideoRoutesMixin:
             # so unknown ``extra_params`` keys and similar engine-side
             # rejections surface as HTTP 400 here instead of becoming
             # a queued job whose background task later fails.
-            self.generator.validate_request_params(params)
+            from tensorrt_llm._torch.visual_gen.executor import validate_visual_gen_params
+
+            validate_visual_gen_params(
+                params,
+                pipeline_name=self.generator.executor.pipeline_name,
+                declared_defaults=self.generator.executor.default_generation_params,
+                extra_param_specs=self.generator.executor.extra_param_specs,
+            )
             _preflight_encoder_format(request.format)
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
@@ -333,17 +333,11 @@ class _VideoRoutesMixin:
 
             return JSONResponse(content=video_job.model_dump(), status_code=202)
 
-        except VisualGenValidationError as exc:
-            logger.error(f"Async video validation error: {exc.message}")
-            return self.create_error_response(
-                message=exc.message,
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
         except ValidationError as exc:
             return self._render_pydantic_validation_error(exc)
         except ValueError as e:
-            logger.error(f"Request parsing error: {e}")
-            return self.create_error_response(str(e))
+            logger.error(f"Async video request error: {e}")
+            return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(

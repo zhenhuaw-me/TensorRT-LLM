@@ -1965,8 +1965,6 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
-        from tensorrt_llm._torch.visual_gen.executor import \
-            VisualGenValidationError
         from tensorrt_llm.media.tensor_payload import is_tensor_format
 
         try:
@@ -2066,14 +2064,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
-        except VisualGenValidationError as exc:
-            logger.error(f"Image validation error: {exc.message}")
-            return self.create_error_response(
-                message=exc.message,
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
         except ValueError as exc:
-            logger.error(f"Image conversion error: {exc}")
+            logger.error(f"Image request error: {exc}")
             return self.create_error_response(
                 message=str(exc),
                 status_code=HTTPStatus.BAD_REQUEST,

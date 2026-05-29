@@ -165,9 +165,7 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
         return VisualGenOutput(
             request_id=resp.request_id,
             error=resp.error_msg,
-            error_reason=resp.error_reason,
-            error_param=resp.error_param,
-            error_details=resp.error_details,
+            is_validation_error=resp.is_validation_error,
         )
     out = resp.output
     metrics = VisualGenMetrics(
@@ -206,9 +204,7 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
             VisualGenOutput(
                 request_id=resp.request_id,
                 error=resp.error_msg,
-                error_reason=resp.error_reason,
-                error_param=resp.error_param,
-                error_details=resp.error_details,
+                is_validation_error=resp.is_validation_error,
             )
             for _ in range(batch_size)
         ]

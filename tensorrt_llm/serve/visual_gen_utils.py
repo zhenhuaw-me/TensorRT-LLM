@@ -103,8 +103,8 @@ def parse_visual_gen_params(
     The HTTP layer never invents a default. Validation lives elsewhere:
     Pydantic at the request boundary (422), this helper for translation
     errors (400 via ``ValueError``), and the executor's
-    ``_validate_request`` for ``extra_params`` strict-key/type/range
-    checks (400 via ``VisualGenValidationError``).
+    ``validate_visual_gen_params`` for ``extra_params``
+    strict-key/type/range checks (400 via ``ValueError``).
     """
     if isinstance(request, ImageEditRequest):
         return _parse_image_edit_request(request, generator)

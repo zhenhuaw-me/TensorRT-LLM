@@ -9,9 +9,9 @@
 on every successful output and is ``None`` on error outputs.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -98,12 +98,12 @@ class VisualGenOutput:
     audio_sample_rate: Optional[int] = None
     error: Optional[str] = None
     metrics: Optional[VisualGenMetrics] = None
-    # Structured metadata for validation failures. Populated only when
-    # the engine raised :class:`VisualGenValidationError`; ``None`` on
-    # success and on non-validation failures.
-    error_reason: Optional[str] = None
-    error_param: Optional[str] = None
-    error_details: Optional[Dict[str, Any]] = field(default=None)
+    # True when ``error`` came from request-parameter validation
+    # (i.e. the worker raised :class:`ValueError`). Coordinator-side
+    # awaiters use this flag to re-raise as :class:`ValueError`
+    # (callers that catch ``ValueError`` see the validation failure)
+    # vs :class:`RuntimeError` for engine-side runtime failures.
+    is_validation_error: bool = False
 
     def save(
         self,

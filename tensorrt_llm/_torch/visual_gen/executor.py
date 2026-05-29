@@ -4,8 +4,8 @@ import secrets
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -58,49 +58,12 @@ class DiffusionResponse:
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
     generation: float = 0.0
-    # Structured validation error metadata, populated only when the failure
-    # was raised as :class:`VisualGenValidationError`. ``None`` on success
-    # and on non-validation failures.
-    error_reason: Optional[str] = None
-    error_param: Optional[str] = None
-    error_details: Optional[Dict[str, Any]] = field(default=None)
-
-
-class VisualGenValidationError(ValueError):
-    """Transport-neutral validation error raised by
-    :meth:`DiffusionExecutor._validate_request` for per-request parameter
-    violations.
-
-    Subclasses ``ValueError`` so existing ``except ValueError`` blocks
-    continue to work. The structured fields exist for server-side logs
-    and future programmatic discriminators; the serve layer reads
-    ``message`` for the wire body.
-    """
-
-    REASONS = (
-        "unknown_extra_param",
-        "extra_param_type_mismatch",
-        "extra_param_out_of_range",
-        "unsupported_universal_field",
-    )
-
-    def __init__(
-        self,
-        reason: Literal[
-            "unknown_extra_param",
-            "extra_param_type_mismatch",
-            "extra_param_out_of_range",
-            "unsupported_universal_field",
-        ],
-        param: str,
-        message: str,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(message)
-        self.reason = reason
-        self.param = param
-        self.message = message
-        self.details = details or {}
+    # True when ``error_msg`` came from request-parameter validation
+    # (i.e. the worker raised :class:`ValueError`). False on success and
+    # on engine/runtime failures. The coordinator uses this flag to
+    # re-raise as :class:`ValueError` (→ HTTP 400) vs
+    # :class:`RuntimeError` (→ HTTP 500).
+    is_validation_error: bool = False
 
 
 # Python type name → accepted Python types for ExtraParamSchema validation.
@@ -114,16 +77,12 @@ _TYPE_MAP = {
 
 # Generation config fields that pipelines declare defaults for.
 # If a user sets one of these but the pipeline doesn't declare it in
-# default_generation_params, the request is rejected with
-# ``unsupported_universal_field`` so unsupported knobs don't get
-# silently dropped (e.g. ``image_cond_strength`` on Wan-T2V, which
-# would otherwise be a top-level field that no pipeline code reads).
-# Conditioning inputs ``image`` and ``negative_prompt`` are still
-# validated at runtime by the pipeline's ``infer()`` and stay out of
-# this set.
-# Order is deliberate: iteration order is observable via the structured
-# ``param`` field on :class:`VisualGenValidationError` when multiple
-# unsupported universal fields are set on one request.
+# default_generation_params, the request is rejected so unsupported
+# knobs don't get silently dropped (e.g. ``image_cond_strength`` on
+# Wan-T2V, which would otherwise be a top-level field that no
+# pipeline code reads). Conditioning inputs ``image`` and
+# ``negative_prompt`` are still validated at runtime by the pipeline's
+# ``infer()`` and stay out of this set.
 _GENERATION_CONFIG_FIELDS: tuple[str, ...] = (
     "height",
     "width",
@@ -145,34 +104,18 @@ def validate_visual_gen_params(
 ) -> None:
     """Validate *params* against pipeline-declared defaults and extra specs.
 
-    Raises :class:`VisualGenValidationError` (a :class:`ValueError`
-    subclass) on:
+    Raises :class:`ValueError` with a multi-line message listing every
+    violation when one or more of:
 
-    - Unknown ``extra_params`` keys
-      (reason ``"unknown_extra_param"``).
+    - Unknown ``extra_params`` keys.
     - Universal fields (e.g. ``num_frames``) set by the user but not
-      declared in ``declared_defaults``
-      (reason ``"unsupported_universal_field"``). Skipped when
-      ``declared_defaults`` is ``None`` — clients that don't carry the
-      per-pipeline universal-field set can still validate
+      declared in ``declared_defaults``. Skipped when
+      ``declared_defaults`` is ``None`` — clients that don't carry
+      the per-pipeline universal-field set can still validate
       ``extra_params``.
-    - Type mismatches for ``extra_params`` values
-      (reason ``"extra_param_type_mismatch"``).
-    - Out-of-range ``extra_params`` values
-      (reason ``"extra_param_out_of_range"``).
-
-    When several categories fail in one request, all messages are
-    concatenated under one exception. The exception's structured
-    ``reason``/``param`` fields carry the first offending category
-    and its first offending key/field; ``details`` carries the full
-    per-category breakdown.
+    - Type mismatches for ``extra_params`` values.
+    - Out-of-range ``extra_params`` values.
     """
-    # Per-category accumulators. Order matters: the first category
-    # with any error supplies the exception's `reason` and `param`.
-    unknown_keys: List[str] = []
-    unsupported_fields: List[str] = []
-    type_mismatches: List[Dict[str, Any]] = []
-    range_violations: List[Dict[str, Any]] = []
     messages: List[str] = []
     specs = extra_param_specs
 
@@ -180,7 +123,6 @@ def validate_visual_gen_params(
     if params.extra_params:
         unknown = sorted(set(params.extra_params.keys()) - set(specs.keys()))
         if unknown:
-            unknown_keys = unknown
             messages.append(
                 f"Unknown extra_params {unknown} for {pipeline_name}. "
                 f"Supported: {sorted(specs.keys())}"
@@ -195,11 +137,9 @@ def validate_visual_gen_params(
         for field_name in _GENERATION_CONFIG_FIELDS:
             value = getattr(params, field_name, None)
             if value is not None and field_name not in declared_defaults:
-                unsupported_fields.append(field_name)
                 messages.append(
                     f"Parameter '{field_name}' is set but {pipeline_name} does "
-                    f"not use it (not in default_generation_params). "
-                    f"It will be silently ignored."
+                    f"not accept it (not in default_generation_params)."
                 )
 
     # --- extra_params type and range checks ---
@@ -214,14 +154,6 @@ def validate_visual_gen_params(
             # Type check
             expected_types = _TYPE_MAP.get(spec.type)
             if expected_types and not isinstance(value, expected_types):
-                type_mismatches.append(
-                    {
-                        "key": key,
-                        "expected_type": spec.type,
-                        "got_type": type(value).__name__,
-                        "value": value,
-                    }
-                )
                 messages.append(
                     f"extra_params['{key}'] expected type '{spec.type}', "
                     f"got {type(value).__name__}: {value!r}"
@@ -231,7 +163,6 @@ def validate_visual_gen_params(
             if spec.range is not None and isinstance(value, (int, float)):
                 lo, hi = spec.range
                 if not (lo <= value <= hi):
-                    range_violations.append({"key": key, "value": value, "range": [lo, hi]})
                     messages.append(
                         f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
                     )
@@ -239,44 +170,10 @@ def validate_visual_gen_params(
     if not messages:
         return
 
-    msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
-        f"  - {e}" for e in messages
+    raise ValueError(
+        f"Parameter validation failed for {pipeline_name}:\n"
+        + "\n".join(f"  - {e}" for e in messages)
     )
-
-    # Pick the first non-empty category as the exception's primary
-    # reason/param. Order mirrors the checks above.
-    if unknown_keys:
-        reason: Literal[
-            "unknown_extra_param",
-            "extra_param_type_mismatch",
-            "extra_param_out_of_range",
-            "unsupported_universal_field",
-        ] = "unknown_extra_param"
-        param = unknown_keys[0]
-    elif unsupported_fields:
-        reason = "unsupported_universal_field"
-        param = unsupported_fields[0]
-    elif type_mismatches:
-        reason = "extra_param_type_mismatch"
-        param = type_mismatches[0]["key"]
-    else:
-        reason = "extra_param_out_of_range"
-        param = range_violations[0]["key"]
-
-    details: Dict[str, Any] = {"pipeline": pipeline_name}
-    if unknown_keys:
-        details["unknown_extra_param"] = {
-            "keys": unknown_keys,
-            "supported": sorted(specs.keys()),
-        }
-    if unsupported_fields:
-        details["unsupported_universal_field"] = {"fields": unsupported_fields}
-    if type_mismatches:
-        details["extra_param_type_mismatch"] = type_mismatches
-    if range_violations:
-        details["extra_param_out_of_range"] = range_violations
-
-    raise VisualGenValidationError(reason, param, msg, details)
 
 
 class DiffusionExecutor:
@@ -371,6 +268,7 @@ class DiffusionExecutor:
                     request_id=-1,
                     output={
                         "status": "READY",
+                        "pipeline_name": self.pipeline.__class__.__name__,
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
                     },
@@ -507,19 +405,19 @@ class DiffusionExecutor:
                         generation=generation,
                     )
                 )
-        except VisualGenValidationError as e:
-            # Validation failures keep their structured metadata so the
-            # serve layer can map them onto a clean 400 response without
-            # rebuilding the error context from the message string.
-            logger.error(f"Worker {self.device_id}: Validation error: {e.message}")
+        except ValueError as e:
+            # ``ValueError`` is the stock-Python signal that the request was
+            # malformed (raised by ``validate_visual_gen_params`` and by
+            # pipelines' own ``infer()`` checks). Tag the response so the
+            # coordinator re-raises as ``ValueError`` and the serve layer
+            # renders an HTTP 400.
+            logger.error(f"Worker {self.device_id}: Validation error: {e}")
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
-                        error_msg=e.message,
-                        error_reason=e.reason,
-                        error_param=e.param,
-                        error_details=e.details,
+                        error_msg=str(e),
+                        is_validation_error=True,
                     )
                 )
         except Exception as e:

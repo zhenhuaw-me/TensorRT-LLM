@@ -25,7 +25,6 @@ import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
@@ -130,8 +129,10 @@ class MockVisualGen:
         audio_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
         batch_aware: bool = True,
-        validation_error: Optional["VisualGenValidationError"] = None,
+        validation_error: Optional[ValueError] = None,
     ):
+        from types import SimpleNamespace
+
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
@@ -144,6 +145,32 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+        # Stand-in for the coordinator-side executor proxy. The async video
+        # route reads ``pipeline_name`` / ``default_generation_params`` /
+        # ``extra_param_specs`` directly off this attribute when running
+        # synchronous pre-flight validation. ``default_generation_params``
+        # declares the universal fields the mock pipeline accepts so the
+        # validator doesn't reject legitimate width/height/num_frames/...
+        # requests; ``extra_param_specs`` lists a single known key so
+        # tests can exercise both the accept-known and reject-unknown
+        # paths.
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        self.executor = SimpleNamespace(
+            pipeline_name="MockPipeline",
+            default_generation_params={
+                "height": 64,
+                "width": 64,
+                "num_inference_steps": 20,
+                "guidance_scale": 5.0,
+                "max_sequence_length": 64,
+                "num_frames": 8,
+                "frame_rate": 8.0,
+            },
+            extra_param_specs={
+                "stg_scale": ExtraParamSchema(type="float", default=1.0),
+            },
+        )
 
     def _maybe_batch(self, tensor, n):
         """Replicate a single tensor along a new leading batch dimension."""
@@ -208,13 +235,6 @@ class MockVisualGen:
     def model(self):
         """Stand-in for VisualGen.model — used by warn-on-set logic."""
         return "test-model"
-
-    def validate_request_params(self, params) -> None:
-        """Stand-in for VisualGen.validate_request_params — raises the
-        configured ``validation_error`` so routes calling pre-flight
-        validation can be exercised end-to-end at the HTTP layer."""
-        if self._validation_error is not None:
-            raise self._validation_error
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -514,8 +534,8 @@ class TestImageGeneration:
         assert resp.status_code == 200
 
     def test_image_generation_failure(self, failing_client):
-        """Engine-side exceptions other than ``VisualGenValidationError``
-        surface as HTTP 500; the LLM envelope carries the error message."""
+        """Engine-side ``RuntimeError`` (non-validation) surfaces as HTTP 500;
+        the LLM envelope carries the error message."""
         resp = failing_client.post(
             "/v1/images/generations",
             json={
@@ -1306,23 +1326,28 @@ class TestAsyncVideoFailureHandling:
 
 
 # =========================================================================
-# Route-level VisualGenValidationError handling
+# Route-level engine-validation-error handling
 # =========================================================================
 
 
-def _make_validation_error(reason: str = "unknown_extra_param", param: str = "stg_sclae"):
-    return VisualGenValidationError(
-        reason=reason,
-        param=param,
-        message=f"Unknown extra_params ['{param}'] for TestPipeline.",
-        details={"pipeline": "TestPipeline", reason: {"keys": [param]}},
+def _make_validation_error(param: str = "stg_sclae"):
+    """Build the kind of stock ``ValueError`` ``validate_visual_gen_params``
+    raises when extra_params contains an unknown key. Tests inject this
+    onto the mock so the routes' ``except ValueError`` arm fires the same
+    way it would in production."""
+    return ValueError(
+        f"Parameter validation failed for MockPipeline:\n"
+        f"  - Unknown extra_params ['{param}'] for MockPipeline. Supported: []"
     )
 
 
-class TestRouteVisualGenValidationError:
-    """When the engine raises ``VisualGenValidationError``, the image
-    and video routes return HTTP 400 with the LLM envelope built from
-    ``exc.message`` — not the generic 500/400 paths."""
+class TestRouteEngineValidationError:
+    """When the engine raises ``ValueError`` (request-shape problem), the
+    image and sync-video routes return HTTP 400 with the LLM envelope
+    built from the exception message. The async-video route runs the
+    same check synchronously via ``validate_visual_gen_params`` so an
+    unknown ``extra_params`` key surfaces as 400 immediately instead of
+    becoming a queued 202 whose background task later fails."""
 
     def test_image_route_renders_validation_error_at_400(self, tmp_path):
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
@@ -1378,16 +1403,14 @@ class TestRouteVisualGenValidationError:
             os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_async_video_route_rejects_validation_error_synchronously(self, tmp_path):
-        """The ``/v1/videos`` route runs a pre-flight engine validation
-        before returning 202 so unknown ``extra_params`` and similar
-        bad-request cases surface as HTTP 400 immediately — not as a
-        queued job whose background task later fails."""
+        """``/v1/videos`` calls ``validate_visual_gen_params`` against the
+        mock's executor metadata before queuing; the mock's
+        ``extra_param_specs={}`` causes any unknown extra to be rejected
+        with a stock ``ValueError`` which the route's ``except ValueError``
+        arm renders as HTTP 400."""
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         try:
-            gen = MockVisualGen(
-                video_output=_make_dummy_video_tensor(),
-                validation_error=_make_validation_error(),
-            )
+            gen = MockVisualGen(video_output=_make_dummy_video_tensor())
             client = _create_server(gen)
             resp = client.post(
                 "/v1/videos",
