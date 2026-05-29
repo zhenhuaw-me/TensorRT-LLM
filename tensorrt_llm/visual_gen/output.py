@@ -17,15 +17,6 @@ import torch
 
 from tensorrt_llm.llmapi.utils import set_api_status
 
-# Suffix → tensor format token mapping. Used by :meth:`VisualGenOutput.save`
-# when the caller omits ``format`` and relies on the path extension to pick
-# the serializer, matching the inference contract that
-# :mod:`tensorrt_llm.media.encoding` applies for image and video encoders.
-_TENSOR_SUFFIX_TO_FORMAT: Dict[str, str] = {
-    ".safetensors": "safetensors",
-    ".pt": "pt",
-}
-
 
 def _infer_format_from_path(
     path: Union[str, Path, List[Union[str, Path]]],
@@ -36,14 +27,17 @@ def _infer_format_from_path(
     tensor suffix; mixed or unrecognized suffixes return ``None`` and
     let the image/video encoder dispatch handle them.
     """
+
+    def _suffix_format(p) -> Optional[str]:
+        suffix = Path(p).suffix
+        return suffix[1:] if suffix in (".safetensors", ".pt") else None
+
     if isinstance(path, list):
         if not path:
             return None
-        formats = {_TENSOR_SUFFIX_TO_FORMAT.get(Path(p).suffix) for p in path}
-        if len(formats) == 1:
-            return next(iter(formats))
-        return None
-    return _TENSOR_SUFFIX_TO_FORMAT.get(Path(path).suffix)
+        formats = {_suffix_format(p) for p in path}
+        return next(iter(formats)) if len(formats) == 1 else None
+    return _suffix_format(path)
 
 
 @set_api_status("prototype")
@@ -126,11 +120,6 @@ class VisualGenOutput:
             path: Where to write. A single :class:`str`/:class:`pathlib.Path`
                 writes one file (batched tensors collapse to the first
                 slice); a list of paths writes one file per batch item.
-                For image/video formats the encoders in
-                :mod:`tensorrt_llm.media.encoding` handle the encode; for
-                tensor formats (``"safetensors"``/``"pt"``) the payload
-                is written via
-                :func:`tensorrt_llm.media.tensor_payload.save_visual_gen_output_payload`.
                 Format is inferred from the extension unless ``format``
                 is given.
             format: Explicit format. Image encoders: ``"png"``, ``"jpg"``,

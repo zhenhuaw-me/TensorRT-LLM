@@ -27,11 +27,7 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
-from tensorrt_llm.media.tensor_payload import (
-    TENSOR_FORMAT_EXTENSIONS,
-    TENSOR_FORMAT_MEDIA_TYPES,
-    is_tensor_format,
-)
+from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
@@ -125,8 +121,8 @@ class _VideoRoutesMixin:
                 )
 
             if is_tensor_format(request.format):
-                ext = TENSOR_FORMAT_EXTENSIONS[request.format]
-                media_type = TENSOR_FORMAT_MEDIA_TYPES[request.format]
+                ext = f".{request.format}"
+                media_type = "application/octet-stream"
                 target = self.media_storage_path / f"{video_id}{ext}"
                 output.save(target, format=request.format)
                 latency = time.perf_counter() - sync_video_start
@@ -379,8 +375,7 @@ class _VideoRoutesMixin:
                 return
 
             if is_tensor_format(request.format):
-                ext = TENSOR_FORMAT_EXTENSIONS[request.format]
-                target = self.media_storage_path / f"{video_id}{ext}"
+                target = self.media_storage_path / f"{video_id}.{request.format}"
                 output.save(target, format=request.format)
                 saved_paths = [target]
             else:
@@ -534,7 +529,7 @@ class _VideoRoutesMixin:
                 if job.response_format == "b64_json":
                     return _b64_json_video_response(video_id, suffix, video_path)
                 if is_tensor_format(suffix):
-                    media_type = TENSOR_FORMAT_MEDIA_TYPES[suffix]
+                    media_type = "application/octet-stream"
                 else:
                     media_type = _video_content_type(video_path.suffix)
                 return FileResponse(

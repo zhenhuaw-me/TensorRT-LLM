@@ -34,18 +34,6 @@ if TYPE_CHECKING:
 # set is treated as a media-encoder request by :meth:`VisualGenOutput.save`.
 TENSOR_FORMATS = frozenset({"safetensors", "pt"})
 
-# File-suffix lookup for path normalization on disk.
-TENSOR_FORMAT_EXTENSIONS: Dict[str, str] = {
-    "safetensors": ".safetensors",
-    "pt": ".pt",
-}
-
-# Media types returned when serve routes ship the bytes over HTTP.
-TENSOR_FORMAT_MEDIA_TYPES: Dict[str, str] = {
-    "safetensors": "application/octet-stream",
-    "pt": "application/octet-stream",
-}
-
 
 def is_tensor_format(fmt: Optional[str]) -> bool:
     """Return True when *fmt* names a tensor payload (safetensors / pt)."""
@@ -231,7 +219,7 @@ def save_visual_gen_output_payload(
     """
     target = Path(path)
     if target.suffix == "":
-        target = target.with_suffix(TENSOR_FORMAT_EXTENSIONS[fmt])
+        target = target.with_suffix(f".{fmt}")
     target.parent.mkdir(parents=True, exist_ok=True)
     data = serialize_visual_gen_output(
         output,

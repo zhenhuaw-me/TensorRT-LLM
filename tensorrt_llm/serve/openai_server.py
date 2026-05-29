@@ -1967,8 +1967,7 @@ class OpenAIServer(_VideoRoutesMixin):
         """
         from tensorrt_llm._torch.visual_gen.executor import \
             VisualGenValidationError
-        from tensorrt_llm.media.tensor_payload import (TENSOR_FORMAT_EXTENSIONS,
-                                                       is_tensor_format)
+        from tensorrt_llm.media.tensor_payload import is_tensor_format
 
         try:
             image_id = f"image_{uuid.uuid4().hex}"
@@ -1993,7 +1992,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # emitting one ``ImageObject`` per batch item.
                 from tensorrt_llm.media.tensor_payload import infer_batch_size
 
-                ext = TENSOR_FORMAT_EXTENSIONS[request.format]
+                ext = f".{request.format}"
                 batch_size = infer_batch_size(output)
                 if request.response_format == "b64_json":
                     data = [

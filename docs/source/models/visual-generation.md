@@ -79,58 +79,6 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
 
-### Request Schema
-
-`ImageGenerationRequest` and `VideoGenerationRequest` map one-to-one to
-`VisualGenParams`. Common per-request fields:
-
-- `prompt` (required), `negative_prompt`, `seed`, `num_inference_steps`,
-  `guidance_scale`, `max_sequence_length`.
-- `size` (OpenAI-shaped `WxH` string) or the structured `width` + `height`
-  pair (both required when sent — sending exactly one is rejected with
-  HTTP 422).
-- `response_format`: `"url"` writes the result under the server's media
-  storage path and returns its URL; `"b64_json"` base64-encodes the bytes
-  inline.
-- `format`: generation content encoding. Image encoders accept `"png"`,
-  `"webp"`, `"jpeg"`. Video encoders accept `"mp4"`, `"avi"`, `"auto"`.
-  Both endpoints also accept `"safetensors"` and `"pt"` for tensor
-  payloads (raw model tensors plus scalar metadata in a single file).
-- `extra_params` (object): model-specific overflow. Keys must match the
-  loaded pipeline's `extra_param_specs`; unknown keys are rejected with
-  HTTP 400 (unknown-extra-param). Use the Python API to discover keys
-  (`VisualGen.extra_param_specs`).
-
-Image-only fields: `n` (number of images per prompt). Video-only
-fields: `num_frames`, `seconds`, `frame_rate` (canonical) / `fps`
-(alias), `image_cond_strength`, `input_reference`.
-
-OpenAI-shape fields accepted with no engine semantic: `model`,
-`quality`, `style`, `user` (image only); `model` (video). Sending
-`quality` or `style` logs a server-side warning; `model` warns on
-mismatch with the loaded model id; `user` is silent.
-
-#### Unknown-field policy
-
-The visual-gen endpoints inherit `extra="forbid"`. Any unknown
-top-level request field — `output_format` (use `format`),
-top-level `guidance_rescale` (use `extra_params` when the loaded
-pipeline declares it), top-level `n` on video requests, or any
-typo — returns HTTP 422 with an LLM-style error envelope
-(`{message, type, code}`) naming the offending field. The multipart
-video parser applies the same strict policy.
-
-#### Tensor-return formats
-
-`format="safetensors"` writes a single file with named tensors (`image`,
-`video`, `audio`) plus scalar metadata (`frame_rate`,
-`audio_sample_rate`) as string metadata. `format="pt"` writes the same
-keys via `torch.save`; clients should load with
-`torch.load(buf, weights_only=True)` on PyTorch 2.4+. Both formats
-respect `response_format`: `"url"` returns a URL pointing at the
-on-disk payload; `"b64_json"` base64-encodes the serialized bytes
-into the response body.
-
 ## Optimizations
 
 ### Quantization
