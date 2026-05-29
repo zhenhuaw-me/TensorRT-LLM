@@ -216,7 +216,7 @@ class TestVisualGenArgsFromDict:
         assert dwq is True
 
     def test_quant_config_dict_does_not_leak_dynamic_flags(self):
-        """AC-5: dynamic flags are not part of the VisualGenArgs schema."""
+        """Dynamic quant flags are not part of the VisualGenArgs schema."""
         args = VisualGenArgs(
             model="/tmp/model",
             quant_config={"quant_algo": "FP8", "dynamic": True},

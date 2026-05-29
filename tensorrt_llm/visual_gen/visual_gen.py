@@ -664,11 +664,29 @@ class VisualGenResult:
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface failure via RuntimeError. For batch,
-        # return the list as-is so callers can inspect per-item ``error``.
+        # For single prompts, surface failure via an exception that matches
+        # the engine-side error class:
+        # - validation failures (``error_reason`` populated) re-raise as
+        #   :class:`VisualGenValidationError` so ``except ValueError`` /
+        #   ``except VisualGenValidationError`` callers can branch on the
+        #   structured ``reason`` / ``param`` / ``details`` fields.
+        # - other failures stay as ``RuntimeError`` to preserve the
+        #   pre-existing contract for non-validation engine errors.
+        # For batches, return the list as-is so callers can iterate
+        # per-item ``error`` (and ``error_reason``/``param``/``details``).
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
-            if self._resolved.error is not None:
-                raise RuntimeError(f"Generation failed: {self._resolved.error}")
+            out = self._resolved
+            if out.error is not None:
+                if out.error_reason is not None:
+                    from tensorrt_llm._torch.visual_gen.executor import VisualGenValidationError
+
+                    raise VisualGenValidationError(
+                        out.error_reason,
+                        out.error_param or "",
+                        out.error,
+                        out.error_details,
+                    )
+                raise RuntimeError(f"Generation failed: {out.error}")
         return self._resolved
 
 
@@ -773,6 +791,30 @@ class VisualGen:
         model-specific parameters passed via ``extra_params``.
         """
         return self.executor.extra_param_specs
+
+    def validate_request_params(self, params: VisualGenParams) -> None:
+        """Validate *params* synchronously on the coordinator side.
+
+        Mirrors the worker's ``DiffusionExecutor._validate_request``
+        check using the pipeline metadata propagated through the READY
+        payload (``default_generation_params`` and
+        ``extra_param_specs``). Raises
+        :class:`tensorrt_llm._torch.visual_gen.executor.VisualGenValidationError`
+        on unknown ``extra_params`` keys, type / range mismatches, or
+        universal fields the pipeline does not declare.
+
+        Used by serve routes (notably ``POST /v1/videos``) to reject
+        bad requests synchronously instead of returning HTTP 202 and
+        having the background task fail later.
+        """
+        from tensorrt_llm._torch.visual_gen.executor import validate_visual_gen_params
+
+        validate_visual_gen_params(
+            params,
+            pipeline_name=type(self).__name__,
+            declared_defaults=self.executor.default_generation_params,
+            extra_param_specs=self.executor.extra_param_specs,
+        )
 
     @property
     def default_params(self) -> "VisualGenParams":

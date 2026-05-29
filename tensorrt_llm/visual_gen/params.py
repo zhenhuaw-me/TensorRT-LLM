@@ -46,7 +46,13 @@ class VisualGenParams(StrictBaseModel):
     max_sequence_length: Optional[int] = Field(
         default=None, description="Max tokens for text encoding."
     )
-    seed: int = Field(default=42, description="Random seed for reproducibility.")
+    seed: Optional[int] = Field(
+        default=None,
+        description=(
+            "Random seed for reproducibility. ``None`` means the engine draws "
+            "a fresh seed on the coordinator rank before pipeline dispatch."
+        ),
+    )
 
     # Video
     num_frames: Optional[int] = Field(
@@ -58,9 +64,6 @@ class VisualGenParams(StrictBaseModel):
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
-    )
-    mask: Optional[Union[str, bytes, List[bytes]]] = Field(
-        default=None, description="Inpainting mask path or raw bytes."
     )
     image_cond_strength: Optional[float] = Field(
         default=None, description="Image conditioning strength."

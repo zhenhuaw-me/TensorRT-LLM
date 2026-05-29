@@ -267,20 +267,45 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "flux1", "flux2")
-- `prompt`: Text description
+- `prompt`: Text description (required)
 - `n`: Number of images to generate
-- `size`: Image dimensions (e.g., "512x512", "1024x1024")
-- `quality`: "standard" or "hd"
-- `response_format`: "b64_json" or "url"
+- `size`: Image dimensions in `WxH` format (e.g., `"512x512"`, `"1024x1024"`) — or use the structured pair `width` + `height` (both required when sent)
+- `seed`: Random seed; `null` / omitted means the engine draws a fresh seed
+- `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls (override pipeline defaults when sent)
+- `extra_params`: model-specific overflow as a JSON object (see "Model-Specific `extra_params`" below). Unknown keys are rejected by the executor.
+- `response_format`: `"b64_json"` or `"url"`
+- `format`: Generation content encoding (renamed from `output_format`). Image encoders: `"png"`, `"webp"`, `"jpeg"`. Tensor formats: `"safetensors"`, `"pt"`.
+- Accept-and-warn OpenAI-shape fields (no engine semantic): `model`, `quality`, `style`, `user`. Sending `quality`/`style` logs a server-side WARNING; sending `model` warns on mismatch. None of these change generation behavior.
 
 ### Video Generation
-- `model`: Model identifier (e.g., "wan", "ltx2")
-- `prompt`: Text description
-- `size`: Video resolution (e.g., "256x256", "512x512", "1280x720")
-- `seconds`: Duration in seconds
-- `fps`: Frames per second
-- `input_reference`: Reference image file (for TI2V mode)
+- `prompt`: Text description (required)
+- `size` / `width` / `height`: same convention as image
+- `seconds`: Duration in seconds (engine multiplies by `frame_rate` to derive `num_frames` when the latter is absent)
+- `frame_rate` (canonical) or `fps` (alias): frames per second
+- `num_frames`: when set, wins over the `seconds * frame_rate` derivation
+- `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`, `image_cond_strength`: per-request denoise controls
+- `input_reference`: Reference image (TI2V mode); accepted as base64-encoded string in JSON or as a file in multipart form-data
+- `extra_params`: model-specific overflow (see below)
+- `response_format`: `"b64_json"` or `"url"`
+- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
+
+#### Unknown-field policy
+
+The visual-gen endpoints reject unknown top-level fields with HTTP 422 (`extra="forbid"`). Anything model-specific belongs inside `extra_params`. Sending `output_format`, top-level `guidance_rescale`, or — for video — top-level `n` returns 422 with the offending field named in the error body.
+
+#### Model-specific `extra_params`
+
+Use the Python API to discover accepted keys for a loaded pipeline:
+
+```python
+generator = VisualGen(model="...")
+print(generator.extra_param_specs)   # {key: ExtraParamSchema(type=..., range=..., default=..., description=...)}
+```
+
+Examples:
+- **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
+- **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
+- **Wan 2.1 / Flux**: no model-specific `extra_params` declared
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).

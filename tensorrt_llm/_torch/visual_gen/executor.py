@@ -1,10 +1,11 @@
 import os
 import queue
+import secrets
 import threading
 import time
 import traceback
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -57,6 +58,49 @@ class DiffusionResponse:
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
     generation: float = 0.0
+    # Structured validation error metadata, populated only when the failure
+    # was raised as :class:`VisualGenValidationError`. ``None`` on success
+    # and on non-validation failures.
+    error_reason: Optional[str] = None
+    error_param: Optional[str] = None
+    error_details: Optional[Dict[str, Any]] = field(default=None)
+
+
+class VisualGenValidationError(ValueError):
+    """Transport-neutral validation error raised by
+    :meth:`DiffusionExecutor._validate_request` for per-request parameter
+    violations.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` blocks
+    continue to work. The structured fields exist for server-side logs
+    and future programmatic discriminators; the serve layer reads
+    ``message`` for the wire body.
+    """
+
+    REASONS = (
+        "unknown_extra_param",
+        "extra_param_type_mismatch",
+        "extra_param_out_of_range",
+        "unsupported_universal_field",
+    )
+
+    def __init__(
+        self,
+        reason: Literal[
+            "unknown_extra_param",
+            "extra_param_type_mismatch",
+            "extra_param_out_of_range",
+            "unsupported_universal_field",
+        ],
+        param: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.param = param
+        self.message = message
+        self.details = details or {}
 
 
 # Python type name → accepted Python types for ExtraParamSchema validation.
@@ -70,20 +114,169 @@ _TYPE_MAP = {
 
 # Generation config fields that pipelines declare defaults for.
 # If a user sets one of these but the pipeline doesn't declare it in
-# default_generation_params, the value will be silently ignored.
-# Conditioning inputs (image, negative_prompt, mask, image_cond_strength)
-# are excluded — they are validated at runtime by the pipeline's infer().
-_GENERATION_CONFIG_FIELDS = frozenset(
-    {
-        "height",
-        "width",
-        "num_inference_steps",
-        "guidance_scale",
-        "max_sequence_length",
-        "num_frames",
-        "frame_rate",
-    }
+# default_generation_params, the request is rejected with
+# ``unsupported_universal_field`` so unsupported knobs don't get
+# silently dropped (e.g. ``image_cond_strength`` on Wan-T2V, which
+# would otherwise be a top-level field that no pipeline code reads).
+# Conditioning inputs ``image`` and ``negative_prompt`` are still
+# validated at runtime by the pipeline's ``infer()`` and stay out of
+# this set.
+# Order is deliberate: iteration order is observable via the structured
+# ``param`` field on :class:`VisualGenValidationError` when multiple
+# unsupported universal fields are set on one request.
+_GENERATION_CONFIG_FIELDS: tuple[str, ...] = (
+    "height",
+    "width",
+    "num_inference_steps",
+    "guidance_scale",
+    "max_sequence_length",
+    "num_frames",
+    "frame_rate",
+    "image_cond_strength",
 )
+
+
+def validate_visual_gen_params(
+    params: "VisualGenParams",
+    *,
+    pipeline_name: str,
+    declared_defaults: Optional[Dict[str, Any]],
+    extra_param_specs: Dict[str, Any],
+) -> None:
+    """Validate *params* against pipeline-declared defaults and extra specs.
+
+    Raises :class:`VisualGenValidationError` (a :class:`ValueError`
+    subclass) on:
+
+    - Unknown ``extra_params`` keys
+      (reason ``"unknown_extra_param"``).
+    - Universal fields (e.g. ``num_frames``) set by the user but not
+      declared in ``declared_defaults``
+      (reason ``"unsupported_universal_field"``). Skipped when
+      ``declared_defaults`` is ``None`` — clients that don't carry the
+      per-pipeline universal-field set can still validate
+      ``extra_params``.
+    - Type mismatches for ``extra_params`` values
+      (reason ``"extra_param_type_mismatch"``).
+    - Out-of-range ``extra_params`` values
+      (reason ``"extra_param_out_of_range"``).
+
+    When several categories fail in one request, all messages are
+    concatenated under one exception. The exception's structured
+    ``reason``/``param`` fields carry the first offending category
+    and its first offending key/field; ``details`` carries the full
+    per-category breakdown.
+    """
+    # Per-category accumulators. Order matters: the first category
+    # with any error supplies the exception's `reason` and `param`.
+    unknown_keys: List[str] = []
+    unsupported_fields: List[str] = []
+    type_mismatches: List[Dict[str, Any]] = []
+    range_violations: List[Dict[str, Any]] = []
+    messages: List[str] = []
+    specs = extra_param_specs
+
+    # --- unknown extra_params keys ---
+    if params.extra_params:
+        unknown = sorted(set(params.extra_params.keys()) - set(specs.keys()))
+        if unknown:
+            unknown_keys = unknown
+            messages.append(
+                f"Unknown extra_params {unknown} for {pipeline_name}. "
+                f"Supported: {sorted(specs.keys())}"
+            )
+
+    # --- unsupported universal fields ---
+    # Check generation config fields the user explicitly set (not None)
+    # that the pipeline never declared in declared_defaults.
+    # Conditioning inputs (image, negative_prompt, image_cond_strength)
+    # are excluded — they are validated at runtime by the pipeline's infer().
+    if declared_defaults is not None:
+        for field_name in _GENERATION_CONFIG_FIELDS:
+            value = getattr(params, field_name, None)
+            if value is not None and field_name not in declared_defaults:
+                unsupported_fields.append(field_name)
+                messages.append(
+                    f"Parameter '{field_name}' is set but {pipeline_name} does "
+                    f"not use it (not in default_generation_params). "
+                    f"It will be silently ignored."
+                )
+
+    # --- extra_params type and range checks ---
+    if params.extra_params:
+        for key, value in params.extra_params.items():
+            if key not in specs:
+                continue  # already reported as unknown above
+            spec = specs[key]
+            # Skip None values (param left at its None default)
+            if value is None:
+                continue
+            # Type check
+            expected_types = _TYPE_MAP.get(spec.type)
+            if expected_types and not isinstance(value, expected_types):
+                type_mismatches.append(
+                    {
+                        "key": key,
+                        "expected_type": spec.type,
+                        "got_type": type(value).__name__,
+                        "value": value,
+                    }
+                )
+                messages.append(
+                    f"extra_params['{key}'] expected type '{spec.type}', "
+                    f"got {type(value).__name__}: {value!r}"
+                )
+                continue  # skip range check if type is wrong
+            # Range check (numeric only)
+            if spec.range is not None and isinstance(value, (int, float)):
+                lo, hi = spec.range
+                if not (lo <= value <= hi):
+                    range_violations.append({"key": key, "value": value, "range": [lo, hi]})
+                    messages.append(
+                        f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
+                    )
+
+    if not messages:
+        return
+
+    msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
+        f"  - {e}" for e in messages
+    )
+
+    # Pick the first non-empty category as the exception's primary
+    # reason/param. Order mirrors the checks above.
+    if unknown_keys:
+        reason: Literal[
+            "unknown_extra_param",
+            "extra_param_type_mismatch",
+            "extra_param_out_of_range",
+            "unsupported_universal_field",
+        ] = "unknown_extra_param"
+        param = unknown_keys[0]
+    elif unsupported_fields:
+        reason = "unsupported_universal_field"
+        param = unsupported_fields[0]
+    elif type_mismatches:
+        reason = "extra_param_type_mismatch"
+        param = type_mismatches[0]["key"]
+    else:
+        reason = "extra_param_out_of_range"
+        param = range_violations[0]["key"]
+
+    details: Dict[str, Any] = {"pipeline": pipeline_name}
+    if unknown_keys:
+        details["unknown_extra_param"] = {
+            "keys": unknown_keys,
+            "supported": sorted(specs.keys()),
+        }
+    if unsupported_fields:
+        details["unsupported_universal_field"] = {"fields": unsupported_fields}
+    if type_mismatches:
+        details["extra_param_type_mismatch"] = type_mismatches
+    if range_violations:
+        details["extra_param_out_of_range"] = range_violations
+
+    raise VisualGenValidationError(reason, param, msg, details)
 
 
 class DiffusionExecutor:
@@ -191,6 +384,12 @@ class DiffusionExecutor:
             if self.rank == 0:
                 req = self.requests_ipc.get()
                 logger.info(f"Worker {self.device_id}: Request available")
+                if req is not None:
+                    # Materialize a concrete seed on the coordinator rank
+                    # before broadcasting so every rank sees the same value.
+                    # Drawing per-rank would diverge under multi-rank
+                    # parallelism (cfg_size, ulysses_size).
+                    self._resolve_seed(req)
 
             # Broadcast to all ranks
             obj_list = [req]
@@ -206,6 +405,26 @@ class DiffusionExecutor:
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
             self.process_request(req)
+
+    def _resolve_seed(self, req: DiffusionRequest) -> None:
+        """Materialize a concrete seed when the client omitted one.
+
+        Called once per request on the coordinator rank (rank 0) before
+        :func:`torch.distributed.broadcast_object_list`. After broadcast,
+        all ranks see the same integer, so downstream pipelines never need
+        to draw their own randomness. Direct callers (e.g. unit tests
+        invoking :meth:`process_request` without going through
+        :meth:`serve_forever`) can call this idempotently — when
+        ``req.params`` is ``None`` a fresh :class:`VisualGenParams` is
+        constructed and seeded; when ``seed`` is already an integer the
+        method is a no-op.
+        """
+        if req.params is None:
+            from tensorrt_llm.visual_gen.params import VisualGenParams
+
+            req.params = VisualGenParams()
+        if req.params.seed is None:
+            req.params.seed = secrets.randbits(63)
 
     def _merge_defaults(self, req: DiffusionRequest):
         """Fill ``None`` fields in *req.params* with pipeline-specific defaults.
@@ -243,76 +462,25 @@ class DiffusionExecutor:
     def _validate_request(self, req: DiffusionRequest):
         """Validate *req.params* against the loaded pipeline's declared parameters.
 
-        Raises ``ValueError`` on:
-        - Unknown ``extra_params`` keys
-        - Universal fields (e.g. ``num_frames``) set by the user but not
-          declared in the pipeline's ``default_generation_params``
-        - Type mismatches for ``extra_params`` values
-        - Out-of-range ``extra_params`` values
+        Worker-side entry point — delegates to
+        :func:`validate_visual_gen_params` with the pipeline's declared
+        defaults and extra-param specs.
         """
-        params = req.params
-        errors: list[str] = []
-        pipeline_name = self.pipeline.__class__.__name__
-        declared_defaults = self.pipeline.default_generation_params
-        specs = self.pipeline.extra_param_specs
-
-        # --- unknown extra_params keys ---
-        if params.extra_params:
-            unknown = set(params.extra_params.keys()) - set(specs.keys())
-            if unknown:
-                errors.append(
-                    f"Unknown extra_params {sorted(unknown)} for {pipeline_name}. "
-                    f"Supported: {sorted(specs.keys())}"
-                )
-
-        # --- unsupported universal fields ---
-        # Check generation config fields the user explicitly set (not None)
-        # that the pipeline never declared in default_generation_params.
-        # Conditioning inputs (image, negative_prompt, mask) are excluded —
-        # they are validated at runtime by the pipeline's infer().
-        for field_name in _GENERATION_CONFIG_FIELDS:
-            value = getattr(params, field_name, None)
-            if value is not None and field_name not in declared_defaults:
-                errors.append(
-                    f"Parameter '{field_name}' is set but {pipeline_name} does "
-                    f"not use it (not in default_generation_params). "
-                    f"It will be silently ignored."
-                )
-
-        # --- extra_params type and range checks ---
-        if params.extra_params:
-            for key, value in params.extra_params.items():
-                if key not in specs:
-                    continue  # already reported as unknown above
-                spec = specs[key]
-                # Skip None values (param left at its None default)
-                if value is None:
-                    continue
-                # Type check
-                expected_types = _TYPE_MAP.get(spec.type)
-                if expected_types and not isinstance(value, expected_types):
-                    errors.append(
-                        f"extra_params['{key}'] expected type '{spec.type}', "
-                        f"got {type(value).__name__}: {value!r}"
-                    )
-                    continue  # skip range check if type is wrong
-                # Range check (numeric only)
-                if spec.range is not None and isinstance(value, (int, float)):
-                    lo, hi = spec.range
-                    if not (lo <= value <= hi):
-                        errors.append(
-                            f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
-                        )
-
-        if errors:
-            msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(msg)
+        validate_visual_gen_params(
+            req.params,
+            pipeline_name=self.pipeline.__class__.__name__,
+            declared_defaults=self.pipeline.default_generation_params,
+            extra_param_specs=self.pipeline.extra_param_specs,
+        )
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
         try:
+            # Idempotent fallback for direct callers (unit tests). In
+            # production ``serve_forever`` has already resolved the seed
+            # on rank 0 before broadcast, so this is a no-op on the live
+            # path.
+            self._resolve_seed(req)
             self._merge_defaults(req)
             cache_key = self.pipeline.warmup_cache_key(
                 req.params.height, req.params.width, num_frames=req.params.num_frames
@@ -337,6 +505,21 @@ class DiffusionExecutor:
                         request_id=req.request_id,
                         output=output,
                         generation=generation,
+                    )
+                )
+        except VisualGenValidationError as e:
+            # Validation failures keep their structured metadata so the
+            # serve layer can map them onto a clean 400 response without
+            # rebuilding the error context from the message string.
+            logger.error(f"Worker {self.device_id}: Validation error: {e.message}")
+            if self.rank == 0:
+                self.response_queue.put(
+                    DiffusionResponse(
+                        request_id=req.request_id,
+                        error_msg=e.message,
+                        error_reason=e.reason,
+                        error_param=e.param,
+                        error_details=e.details,
                     )
                 )
         except Exception as e:

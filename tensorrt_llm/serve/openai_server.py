@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
+from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, Dict, List,
                     Optional, Union)
 
 import uvicorn
@@ -184,6 +184,24 @@ def _normalize_image_output(image) -> list:
     return [image]
 
 
+# Maps the ``format`` token on ``ImageGenerationRequest`` to the values
+# expected by :func:`tensorrt_llm.media.encoding.image_to_bytes` (Pillow
+# format name) and the on-disk file extension. Tensor formats
+# (``"safetensors"`` / ``"pt"``) are dispatched separately via
+# :mod:`tensorrt_llm.media.tensor_payload`.
+_IMAGE_FORMAT_TO_PIL: Dict[str, str] = {
+    "png": "PNG",
+    "webp": "WEBP",
+    "jpeg": "JPEG",
+}
+
+_IMAGE_FORMAT_TO_EXT: Dict[str, str] = {
+    "png": ".png",
+    "webp": ".webp",
+    "jpeg": ".jpg",
+}
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     def __init__(
@@ -321,6 +339,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            if self.server_role is ServerRole.VISUAL_GEN:
+                return self._create_visual_gen_validation_error_response(exc)
+            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
+            # response shape that integration tests (e.g.
+            # ``test_malformed_json_request``) and existing clients
+            # expect.
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
@@ -590,6 +614,36 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
 
+    def _create_visual_gen_validation_error_response(
+            self, exc: RequestValidationError) -> Response:
+        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
+
+        The body has the LLM-style ``{message, type, code}`` shape with
+        HTTP 422. The ``message`` field names the offending field(s) for
+        each error in ``exc.errors()`` so clients can fix the request
+        without parsing the full Pydantic payload.
+        """
+        parts: List[str] = []
+        for err in exc.errors():
+            loc = ".".join(
+                str(seg) for seg in err.get("loc", ()) if seg != "body")
+            etype = err.get("type", "")
+            msg = err.get("msg", "")
+            if etype == "extra_forbidden":
+                parts.append(
+                    f"Unknown request field {loc!r}. Pass model-specific "
+                    "parameters via 'extra_params' instead.")
+            elif loc:
+                parts.append(f"{loc}: {msg}")
+            else:
+                parts.append(msg)
+        message = "; ".join(parts) if parts else str(exc)
+        return self.create_error_response(
+            message=message,
+            err_type="BadRequestError",
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
     def _check_health(self) -> bool:
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
@@ -747,6 +801,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/images/edits",
                                self.openai_image_edit,
                                methods=["POST"])
+        self.app.add_api_route("/v1/images/{image_id}/content",
+                               self.get_image_content,
+                               methods=["GET"])
 
         # Video generation endpoints (Extended OpenAI API)
         # Asynchronous video generation (returns immediately with job metadata, OpenAI API)
@@ -1586,6 +1643,7 @@ class OpenAIServer(_VideoRoutesMixin):
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
         """Chat Completion API with harmony format support.
+
         Supports both streaming and non-streaming modes.
         """
 
@@ -1903,8 +1961,15 @@ class OpenAIServer(_VideoRoutesMixin):
                                       raw_request: Request) -> Response:
         """OpenAI-compatible image generation endpoint.
 
-        Follows the OpenAI Images API specification for image generation.
+        Follows the OpenAI Images API specification for image generation,
+        with ``request.format`` extended to accept tensor payloads
+        (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        from tensorrt_llm._torch.visual_gen.executor import \
+            VisualGenValidationError
+        from tensorrt_llm.media.tensor_payload import (TENSOR_FORMAT_EXTENSIONS,
+                                                       is_tensor_format)
+
         try:
             image_id = f"image_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request, image_id, self.generator)
@@ -1922,29 +1987,74 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Build response
-            output_images = _normalize_image_output(output.image)
+            if is_tensor_format(request.format):
+                # Tensor payloads carry every populated modality in a
+                # single file. Match the image-encoder fan-out by
+                # emitting one ``ImageObject`` per batch item.
+                from tensorrt_llm.media.tensor_payload import infer_batch_size
 
-            if request.response_format == "b64_json":
-                data = [
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image)).decode('utf-8'),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ]
-
+                ext = TENSOR_FORMAT_EXTENSIONS[request.format]
+                batch_size = infer_batch_size(output)
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                output.save_bytes(
+                                    request.format,
+                                    batch_index=i)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
+                else:
+                    paths_in = [
+                        self.media_storage_path / f"{image_id}_{i}{ext}"
+                        for i in range(batch_size)
+                    ]
+                    output.save(paths_in, format=request.format)
+                    data = [
+                        ImageObject(
+                            url=self._build_image_content_url(
+                                raw_request, image_id, i),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
+                    output_format=request.format,
                     size=f"{params.width}x{params.height}",
                 )
-
-            elif request.response_format == "url":
-                output.save(self.media_storage_path / f"{image_id}.png")
-                # TODO: Support URL mode
-                return self._create_not_supported_error(
-                    "URL mode is not supported for image generation")
+            else:
+                output_images = _normalize_image_output(output.image)
+                pil_format = _IMAGE_FORMAT_TO_PIL[request.format]
+                ext = _IMAGE_FORMAT_TO_EXT[request.format]
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                image_to_bytes(
+                                    image, format=pil_format)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for image in output_images
+                    ]
+                else:
+                    data = []
+                    for i, image in enumerate(output_images):
+                        path = self.media_storage_path / f"{image_id}_{i}{ext}"
+                        path.write_bytes(
+                            image_to_bytes(image, format=pil_format))
+                        data.append(
+                            ImageObject(
+                                url=self._build_image_content_url(
+                                    raw_request, image_id, i),
+                                revised_prompt=request.prompt,
+                            ))
+                response = ImageGenerationResponse(
+                    created=int(time.time()),
+                    data=data,
+                    output_format=request.format,
+                    size=f"{params.width}x{params.height}",
+                )
 
             latency = time.perf_counter() - image_gen_start  # seconds
             metrics = output.metrics
@@ -1957,9 +2067,65 @@ class OpenAIServer(_VideoRoutesMixin):
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
+        except VisualGenValidationError as exc:
+            logger.error(f"Image validation error: {exc.message}")
+            return self.create_error_response(
+                message=exc.message,
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        except ValueError as exc:
+            logger.error(f"Image conversion error: {exc}")
+            return self.create_error_response(
+                message=str(exc),
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    async def get_image_content(
+        self,
+        image_id: str,
+        raw_request: Request,
+        i: int = 0,
+    ) -> Response:
+        """Serve a generated image by ID and batch index.
+
+        ``GET /v1/images/{image_id}/content?i=<batch_index>`` returns
+        the image file the corresponding ``POST /v1/images/generations``
+        wrote into ``media_storage_path``. ``i`` defaults to ``0`` for
+        single-image requests; URL responses for ``n > 1`` requests
+        carry ``?i=N`` per item.
+        """
+        from fastapi.responses import FileResponse
+
+        for ext in (".png", ".webp", ".jpg", ".jpeg", ".safetensors", ".pt"):
+            candidate = self.media_storage_path / f"{image_id}_{i}{ext}"
+            if candidate.exists():
+                media_type = ("application/octet-stream"
+                              if ext in (".safetensors", ".pt") else
+                              f"image/{ext.lstrip('.').replace('jpg', 'jpeg')}")
+                return FileResponse(
+                    str(candidate),
+                    media_type=media_type,
+                    filename=candidate.name,
+                )
+        return self.create_error_response(
+            message=f"Image {image_id!r} (batch index {i}) not found",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+
+    @staticmethod
+    def _build_image_content_url(raw_request: Request, image_id: str,
+                                 i: int) -> str:
+        """Return a fetchable HTTP URL for a generated image item."""
+        base = str(raw_request.base_url).rstrip("/")
+        return f"{base}/v1/images/{image_id}/content?i={i}"
 
     async def openai_image_edit(self, request: ImageEditRequest,
                                 raw_request: Request) -> Response:

@@ -1331,7 +1331,7 @@ class LTX2Pipeline(BasePipeline):
     # Prompt enhancement
     # ------------------------------------------------------------------
 
-    def _enhance_prompt(self, prompt: str, seed: int = 42) -> str:
+    def _enhance_prompt(self, prompt: str, seed: int) -> str:
         """Use Gemma3 as an LLM to enhance the prompt for video generation."""
         system_prompt = (
             "You are a helpful assistant that enhances text prompts for video generation. "
@@ -1378,7 +1378,8 @@ class LTX2Pipeline(BasePipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
+        *,
+        seed: int,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
