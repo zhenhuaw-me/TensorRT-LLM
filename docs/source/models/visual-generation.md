@@ -166,7 +166,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
 - **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN only).
 - **Attention Parallel** — requires an LSE-capable attention backend (`FA4` and `CUTEDSL`):
-    - **Attention2D** (`attn2d_row_size: N`, `attn2d_col_size: M`): Shards the sequence axis across an `N × M` device mesh (total CP degree = `N · M`; not combinable with Ulysses).
+    - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (total CP degree = `N · M`; not combinable with Ulysses).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (mutually exclusive with Attention2D).
 ## Developer Guide
 
